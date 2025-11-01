@@ -3,26 +3,59 @@ header('Content-Type: application/json');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 set_time_limit(0);
+ini_set('memory_limit', '2G');
 
 // Đường dẫn FFmpeg
-define('FFMPEG_PATH', 'C:\ooxmind\bin\ffmpeg\bin\ffmpeg.exe');
+define('FFMPEG_PATH', 'C:\\ooxmind\\bin\\ffmpeg\\bin\\ffmpeg.exe');
+define('SPEED_FACTOR', 1.1);
 
 class VideoMerger
 {
   private $inputPath;
   private $outputPath;
+  private $logFile;
+  private $progressFile;
 
   public function __construct($inputPath, $outputPath)
   {
     $this->inputPath = rtrim($inputPath, '\\/');
     $this->outputPath = rtrim($outputPath, '\\/');
+    $this->logFile = $this->outputPath . DIRECTORY_SEPARATOR . 'merge_log.txt';
+    $this->progressFile = $this->outputPath . DIRECTORY_SEPARATOR . 'progress.json';
+  }
+
+  private function log($message)
+  {
+    $timestamp = date('Y-m-d H:i:s');
+    @file_put_contents($this->logFile, "[$timestamp] $message\n", FILE_APPEND);
+  }
+
+  private function updateProgress($progress, $status = '')
+  {
+    $data = [
+      'progress' => $progress,
+      'status' => $status,
+      'timestamp' => time()
+    ];
+    @file_put_contents($this->progressFile, json_encode($data));
+  }
+
+  public function getProgress()
+  {
+    if (file_exists($this->progressFile)) {
+      $data = json_decode(file_get_contents($this->progressFile), true);
+      return $data;
+    }
+    return null;
   }
 
   /**
-   * Quét và phân loại files
+   * Quét files thông minh - nhận diện cả SRT không đuôi _en/_vi
    */
   public function scanFiles()
   {
+    $this->log("=== BẮT ĐẦU QUÉT FILES THÔNG MINH ===");
+
     if (!is_dir($this->inputPath)) {
       throw new Exception("Thư mục input không tồn tại: {$this->inputPath}");
     }
@@ -37,6 +70,7 @@ class VideoMerger
     $videos = [];
     $srt_en = [];
     $srt_vi = [];
+    $srt_unknown = []; // SRT không có đuôi _en hoặc _vi
 
     foreach ($files as $file) {
       if ($file === '.' || $file === '..') continue;
@@ -47,54 +81,165 @@ class VideoMerger
       $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
       $nameWithoutExt = pathinfo($file, PATHINFO_FILENAME);
 
-      // Kiểm tra video MP4
+      // Quét video MP4
       if ($ext === 'mp4') {
-        // Lấy số thứ tự từ đầu tên file
         if (preg_match('/^(\d+)/', $file, $matches)) {
           $order = intval($matches[1]);
-          $videos[$order] = $file;
+          $videos[$order] = [
+            'file' => $file,
+            'order' => $order,
+            'path' => $filePath
+          ];
+          $this->log("Video tìm thấy: [$order] $file");
         }
       }
-      // Kiểm tra SRT
+      // Quét SRT thông minh
       elseif ($ext === 'srt') {
-        if (preg_match('/_en$/i', $nameWithoutExt)) {
+        $isEnglish = preg_match('/_en$/i', $nameWithoutExt);
+        $isVietnamese = preg_match('/_vi$/i', $nameWithoutExt);
+
+        if ($isEnglish) {
           // SRT tiếng Anh
           $baseNameWithoutLang = preg_replace('/_en$/i', '', $nameWithoutExt);
           if (preg_match('/^(\d+)/', $baseNameWithoutLang, $matches)) {
             $order = intval($matches[1]);
-            $srt_en[$order] = $file;
+            $srt_en[$order] = [
+              'file' => $file,
+              'order' => $order,
+              'path' => $filePath
+            ];
+            $this->log("SRT EN tìm thấy: [$order] $file");
           }
-        } elseif (preg_match('/_vi$/i', $nameWithoutExt)) {
+        } elseif ($isVietnamese) {
           // SRT tiếng Việt
           $baseNameWithoutLang = preg_replace('/_vi$/i', '', $nameWithoutExt);
           if (preg_match('/^(\d+)/', $baseNameWithoutLang, $matches)) {
             $order = intval($matches[1]);
-            $srt_vi[$order] = $file;
+            $srt_vi[$order] = [
+              'file' => $file,
+              'order' => $order,
+              'path' => $filePath
+            ];
+            $this->log("SRT VI tìm thấy: [$order] $file");
+          }
+        } else {
+          // SRT không có đuôi ngôn ngữ (unknown)
+          if (preg_match('/^(\d+)/', $nameWithoutExt, $matches)) {
+            $order = intval($matches[1]);
+            $srt_unknown[$order] = [
+              'file' => $file,
+              'order' => $order,
+              'path' => $filePath
+            ];
+            $this->log("SRT (no lang) tìm thấy: [$order] $file");
           }
         }
       }
     }
 
-    // Sắp xếp theo số thứ tự
     ksort($videos);
     ksort($srt_en);
     ksort($srt_vi);
+    ksort($srt_unknown);
+
+    $this->log("Tổng: " . count($videos) . " videos, " . count($srt_en) . " SRT EN, " .
+      count($srt_vi) . " SRT VI, " . count($srt_unknown) . " SRT unknown");
+    $this->log("=== KẾT THÚC QUÉT FILES ===\n");
+
+    // Tạo danh sách tất cả SRT với loại
+    $srt_all = [];
+    foreach ($srt_en as $order => $data) {
+      $srt_all[] = ['file' => $data['file'], 'type' => 'en', 'order' => $order];
+    }
+    foreach ($srt_vi as $order => $data) {
+      $srt_all[] = ['file' => $data['file'], 'type' => 'vi', 'order' => $order];
+    }
+    foreach ($srt_unknown as $order => $data) {
+      $srt_all[] = ['file' => $data['file'], 'type' => 'unknown', 'order' => $order];
+    }
 
     return [
-      'videos' => array_values($videos),
-      'srt_en' => array_values($srt_en),
-      'srt_vi' => array_values($srt_vi)
+      'videos' => array_values(array_map(function ($v) {
+        return $v['file'];
+      }, $videos)),
+      'srt_all' => $srt_all,
+      'srt_info' => [
+        'en' => count($srt_en),
+        'vi' => count($srt_vi),
+        'unknown' => count($srt_unknown),
+        'total' => count($srt_en) + count($srt_vi) + count($srt_unknown)
+      ]
     ];
   }
 
   /**
-   * Gộp video sử dụng FFmpeg
+   * Gộp tất cả SRT (xử lý song song nếu có nhiều loại)
    */
-  public function mergeVideos($videoFiles)
+  public function mergeAllSRT($srtFiles, $videoFiles, $outputName = 'merged_output')
   {
+    $this->log("=== BẮT ĐẦU GỘP TẤT CẢ SRT ===");
+
+    // Nhóm SRT theo loại
+    $srt_by_type = [
+      'en' => [],
+      'vi' => [],
+      'unknown' => []
+    ];
+
+    foreach ($srtFiles as $srtData) {
+      $type = $srtData['type'];
+      $srt_by_type[$type][] = $srtData['file'];
+    }
+
+    $merged_count = 0;
+
+    // Gộp SRT English
+    if (!empty($srt_by_type['en'])) {
+      $this->log("Gộp " . count($srt_by_type['en']) . " file SRT EN");
+      $this->mergeSRT($srt_by_type['en'], $videoFiles, $outputName, 'en');
+      $merged_count++;
+    }
+
+    // Gộp SRT Vietnamese
+    if (!empty($srt_by_type['vi'])) {
+      $this->log("Gộp " . count($srt_by_type['vi']) . " file SRT VI");
+      $this->mergeSRT($srt_by_type['vi'], $videoFiles, $outputName, 'vi');
+      $merged_count++;
+    }
+
+    // Gộp SRT Unknown (không đuôi)
+    if (!empty($srt_by_type['unknown'])) {
+      $this->log("Gộp " . count($srt_by_type['unknown']) . " file SRT (no lang)");
+      $this->mergeSRT($srt_by_type['unknown'], $videoFiles, $outputName, '');
+      $merged_count++;
+    }
+
+    $this->log("=== HOÀN THÀNH GỘP SRT: $merged_count loại ===\n");
+
+    return $merged_count;
+  }
+
+  /**
+   * Gộp video với progress tracking
+   */
+  public function mergeVideos($videoFiles, $outputName = 'merged_output')
+  {
+    $this->log("=== BẮT ĐẦU GỘP VIDEO ===");
+
     if (empty($videoFiles)) {
       throw new Exception("Không có video để gộp");
     }
+
+    // Tính tổng thời lượng để estimate progress
+    $totalDuration = 0;
+    foreach ($videoFiles as $video) {
+      $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $video;
+      if (file_exists($videoPath)) {
+        $duration = $this->getVideoDurationRaw($videoPath);
+        $totalDuration += $duration;
+      }
+    }
+    $this->log("Tổng thời lượng video: " . round($totalDuration, 2) . "s");
 
     // Tạo file list cho FFmpeg
     $listFile = $this->outputPath . DIRECTORY_SEPARATOR . 'filelist.txt';
@@ -102,61 +247,138 @@ class VideoMerger
 
     foreach ($videoFiles as $video) {
       $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $video;
-      // Escape đường dẫn cho FFmpeg
+      if (!file_exists($videoPath)) {
+        $this->log("CẢNH BÁO: File không tồn tại: $videoPath");
+        continue;
+      }
       $escapedPath = str_replace('\\', '/', $videoPath);
       $listContent .= "file '" . addslashes($escapedPath) . "'\n";
+      $this->log("Thêm vào danh sách: $video");
+    }
+
+    if (empty($listContent)) {
+      throw new Exception("Không có video hợp lệ để gộp");
     }
 
     file_put_contents($listFile, $listContent);
 
-    // Đường dẫn output
-    $outputVideo = $this->outputPath . DIRECTORY_SEPARATOR . 'merged_output.mp4';
+    $outputVideo = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
 
-    // Xóa file cũ nếu tồn tại
     if (file_exists($outputVideo)) {
       unlink($outputVideo);
+      $this->log("Đã xóa file output cũ");
     }
 
-    // Lệnh FFmpeg để gộp video
+    $metadata = [
+      'title' => $outputName,
+      'author' => 'Video Merger Pro',
+      'copyright' => '© ' . date('Y') . ' - All Rights Reserved',
+      'comment' => 'Processed with Video Merger Pro - Speed x1.1'
+    ];
+
+    $speedFactor = SPEED_FACTOR;
+
+    // Lệnh FFmpeg với progress output
     $command = sprintf(
-      '"%s" -f concat -safe 0 -i "%s" -c copy "%s" 2>&1',
+      '"%s" -f concat -safe 0 -i "%s" -vf "setpts=PTS/%s" -af "atempo=%s" ' .
+        '-metadata title="%s" -metadata author="%s" -metadata copyright="%s" -metadata comment="%s" ' .
+        '-c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k ' .
+        '-progress pipe:1 -y "%s" 2>&1',
       FFMPEG_PATH,
       $listFile,
+      $speedFactor,
+      $speedFactor,
+      $metadata['title'],
+      $metadata['author'],
+      $metadata['copyright'],
+      $metadata['comment'],
       $outputVideo
     );
 
-    exec($command, $output, $returnCode);
+    $this->log("Lệnh FFmpeg: $command");
+    $this->log("Đang xử lý video với progress tracking...");
 
-    // Xóa file list tạm
+    $startTime = microtime(true);
+
+    // Sử dụng proc_open để theo dõi progress real-time
+    $descriptorspec = [
+      0 => ["pipe", "r"],
+      1 => ["pipe", "w"],
+      2 => ["pipe", "w"]
+    ];
+
+    $process = proc_open($command, $descriptorspec, $pipes);
+
+    if (is_resource($process)) {
+      stream_set_blocking($pipes[1], false);
+      stream_set_blocking($pipes[2], false);
+
+      $lastProgress = 0;
+      while (!feof($pipes[1]) || !feof($pipes[2])) {
+        $output = fgets($pipes[1]);
+        $error = fgets($pipes[2]);
+
+        // Parse FFmpeg progress output
+        if ($output && preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
+          $currentTime = intval($matches[1]) / 1000000; // Convert to seconds
+          if ($totalDuration > 0) {
+            $progress = min(($currentTime / $totalDuration) * 100, 99);
+            if ($progress > $lastProgress + 1) { // Update mỗi 1%
+              $this->updateProgress($progress, 'encoding');
+              $lastProgress = $progress;
+              $this->log("Progress: " . round($progress, 1) . "%");
+            }
+          }
+        }
+
+        usleep(100000); // Sleep 0.1s
+      }
+
+      fclose($pipes[0]);
+      fclose($pipes[1]);
+      fclose($pipes[2]);
+      $returnCode = proc_close($process);
+    } else {
+      // Fallback nếu proc_open không hoạt động
+      exec($command, $output, $returnCode);
+    }
+
+    $endTime = microtime(true);
+    $processingTime = round($endTime - $startTime, 2);
+    $this->log("Thời gian xử lý: {$processingTime}s");
+
     @unlink($listFile);
 
     if ($returnCode !== 0) {
-      $errorMsg = implode("\n", $output);
-      throw new Exception("Lỗi khi gộp video: " . $errorMsg);
+      throw new Exception("Lỗi khi gộp video (return code: $returnCode)");
     }
 
     if (!file_exists($outputVideo)) {
       throw new Exception("File video output không được tạo");
     }
 
+    $fileSize = filesize($outputVideo);
+    $this->log("Video output: $outputVideo (" . $this->formatBytes($fileSize) . ")");
+    $this->updateProgress(100, 'completed');
+    $this->log("=== KẾT THÚC GỘP VIDEO ===\n");
+
     return $outputVideo;
   }
 
   /**
-   * Lấy thời lượng video bằng FFmpeg
+   * Lấy thời lượng video thô (chưa điều chỉnh)
    */
-  private function getVideoDuration($videoPath)
+  private function getVideoDurationRaw($videoPath)
   {
     $command = sprintf(
-      '"%s" -i "%s" 2>&1 | findstr "Duration"',
+      '"%s" -i "%s" 2>&1',
       FFMPEG_PATH,
       $videoPath
     );
 
     exec($command, $output);
 
-    if (!empty($output)) {
-      $line = $output[0];
+    foreach ($output as $line) {
       if (preg_match('/Duration: (\d+):(\d+):(\d+\.\d+)/', $line, $matches)) {
         $hours = intval($matches[1]);
         $minutes = intval($matches[2]);
@@ -164,15 +386,25 @@ class VideoMerger
         return $hours * 3600 + $minutes * 60 + $seconds;
       }
     }
-
     return 0;
   }
 
   /**
-   * Gộp file SRT
+   * Lấy thời lượng video (đã điều chỉnh với speed factor)
    */
-  public function mergeSRT($srtFiles, $videoFiles, $lang = 'en')
+  private function getVideoDuration($videoPath)
   {
+    $duration = $this->getVideoDurationRaw($videoPath);
+    return $duration / SPEED_FACTOR;
+  }
+
+  /**
+   * Gộp file SRT với tính toán chính xác
+   */
+  public function mergeSRT($srtFiles, $videoFiles, $outputName = 'merged_output', $lang = 'en')
+  {
+    $this->log("=== BẮT ĐẦU GỘP SRT ($lang) ===");
+
     if (empty($srtFiles)) {
       throw new Exception("Không có file SRT để gộp");
     }
@@ -185,16 +417,19 @@ class VideoMerger
       $srtPath = $this->inputPath . DIRECTORY_SEPARATOR . $srtFile;
 
       if (!file_exists($srtPath)) {
+        $this->log("CẢNH BÁO: File SRT không tồn tại: $srtPath");
         continue;
       }
 
-      $content = file_get_contents($srtPath);
+      $this->log("Xử lý SRT [$index]: $srtFile (offset: " . round($timeOffset, 2) . "s)");
 
-      // Parse SRT
+      $content = file_get_contents($srtPath);
+      $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
+
       $subtitles = $this->parseSRT($content);
+      $this->log("  - Tìm thấy " . count($subtitles) . " phụ đề");
 
       foreach ($subtitles as $subtitle) {
-        // Cộng offset vào thời gian
         $startTime = $this->addTimeOffset($subtitle['start'], $timeOffset);
         $endTime = $this->addTimeOffset($subtitle['end'], $timeOffset);
 
@@ -205,78 +440,83 @@ class VideoMerger
         $subtitleCounter++;
       }
 
-      // Cập nhật offset cho file tiếp theo
+      // Cập nhật offset
       if (isset($videoFiles[$index])) {
         $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $videoFiles[$index];
         $duration = $this->getVideoDuration($videoPath);
         $timeOffset += $duration;
+        $this->log("  - Cộng dồn offset: +" . round($duration, 2) . "s = " . round($timeOffset, 2) . "s");
       }
     }
 
-    // Lưu file SRT đã gộp
-    $outputSRT = $this->outputPath . DIRECTORY_SEPARATOR . 'merged_output_' . $lang . '.srt';
-    file_put_contents($outputSRT, trim($mergedContent));
+    // Đặt tên file output
+    $suffix = '';
+    if ($lang === 'en') {
+      $suffix = '_en';
+    } elseif ($lang === 'vi') {
+      $suffix = '_vi';
+    }
+    // Nếu $lang rỗng (unknown), không thêm suffix
+
+    $outputSRT = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . $suffix . '.srt';
+
+    $bom = "\xEF\xBB\xBF";
+    file_put_contents($outputSRT, $bom . trim($mergedContent));
+
+    $this->log("SRT output: $outputSRT (" . ($subtitleCounter - 1) . " phụ đề)");
+    $this->log("=== KẾT THÚC GỘP SRT ($lang) ===\n");
 
     return $outputSRT;
   }
 
-  /**
-   * Parse nội dung SRT
-   */
   private function parseSRT($content)
   {
     $subtitles = [];
-
-    // Chuẩn hóa line ending
     $content = str_replace(["\r\n", "\r"], "\n", $content);
-
-    // Split thành các block
-    $blocks = preg_split('/\n\s*\n/', trim($content));
+    $content = trim($content);
+    $blocks = preg_split('/\n\s*\n/', $content);
 
     foreach ($blocks as $block) {
-      $lines = explode("\n", trim($block));
+      $block = trim($block);
+      if (empty($block)) continue;
 
+      $lines = explode("\n", $block);
       if (count($lines) < 3) continue;
 
-      // Dòng đầu là số thứ tự (bỏ qua)
-      // Dòng thứ 2 là timeline
-      if (preg_match('/(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})/', $lines[1], $matches)) {
+      $timelineLine = isset($lines[1]) ? $lines[1] : '';
+
+      if (preg_match('/(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})/', $timelineLine, $matches)) {
         $start = $matches[1];
         $end = $matches[2];
-
-        // Các dòng còn lại là text
         $text = implode("\n", array_slice($lines, 2));
+        $text = trim($text);
 
-        $subtitles[] = [
-          'start' => $start,
-          'end' => $end,
-          'text' => $text
-        ];
+        if (!empty($text)) {
+          $subtitles[] = [
+            'start' => $start,
+            'end' => $end,
+            'text' => $text
+          ];
+        }
       }
     }
 
     return $subtitles;
   }
 
-  /**
-   * Cộng offset vào timestamp SRT
-   */
   private function addTimeOffset($timestamp, $offsetSeconds)
   {
-    // Parse timestamp: 00:00:00,000
     if (preg_match('/(\d{2}):(\d{2}):(\d{2}),(\d{3})/', $timestamp, $matches)) {
       $hours = intval($matches[1]);
       $minutes = intval($matches[2]);
       $seconds = intval($matches[3]);
       $milliseconds = intval($matches[4]);
 
-      // Chuyển thành tổng milliseconds
       $totalMs = ($hours * 3600 + $minutes * 60 + $seconds) * 1000 + $milliseconds;
+      $totalMs += round($offsetSeconds * 1000);
 
-      // Cộng offset
-      $totalMs += $offsetSeconds * 1000;
+      if ($totalMs < 0) $totalMs = 0;
 
-      // Chuyển lại thành format SRT
       $ms = $totalMs % 1000;
       $totalSeconds = floor($totalMs / 1000);
       $s = $totalSeconds % 60;
@@ -287,6 +527,17 @@ class VideoMerger
     }
 
     return $timestamp;
+  }
+
+  private function formatBytes($bytes)
+  {
+    $units = ['B', 'KB', 'MB', 'GB'];
+    $i = 0;
+    while ($bytes >= 1024 && $i < count($units) - 1) {
+      $bytes /= 1024;
+      $i++;
+    }
+    return round($bytes, 2) . ' ' . $units[$i];
   }
 }
 
@@ -301,6 +552,11 @@ try {
   $action = $input['action'];
   $inputPath = $input['inputPath'] ?? '';
   $outputPath = $input['outputPath'] ?? '';
+  $outputName = $input['outputName'] ?? 'merged_output';
+
+  if (empty($inputPath) || empty($outputPath)) {
+    throw new Exception('Input path và output path không được để trống');
+  }
 
   $merger = new VideoMerger($inputPath, $outputPath);
 
@@ -309,32 +565,48 @@ try {
       $files = $merger->scanFiles();
       echo json_encode([
         'success' => true,
-        'files' => $files
+        'files' => $files,
+        'srt_info' => $files['srt_info']
+      ]);
+      break;
+
+    case 'merge_all_srt':
+      $srtFiles = $input['srt_files'] ?? [];
+      $videos = $input['videos'] ?? [];
+
+      if (empty($srtFiles)) {
+        throw new Exception('Không có file SRT để gộp');
+      }
+
+      $mergedCount = $merger->mergeAllSRT($srtFiles, $videos, $outputName);
+      echo json_encode([
+        'success' => true,
+        'merged_count' => $mergedCount
       ]);
       break;
 
     case 'merge_video':
       $videos = $input['videos'] ?? [];
-      $outputFile = $merger->mergeVideos($videos);
+      if (empty($videos)) {
+        throw new Exception('Không có video để gộp');
+      }
+      $outputFile = $merger->mergeVideos($videos, $outputName);
       echo json_encode([
         'success' => true,
         'output' => $outputFile
       ]);
       break;
 
-    case 'merge_srt':
-      $srtFiles = $input['srtFiles'] ?? [];
-      $videos = $input['videos'] ?? [];
-      $lang = $input['lang'] ?? 'en';
-      $outputFile = $merger->mergeSRT($srtFiles, $videos, $lang);
+    case 'get_progress':
+      $progress = $merger->getProgress();
       echo json_encode([
         'success' => true,
-        'output' => $outputFile
+        'progress' => $progress ? $progress['progress'] : 0
       ]);
       break;
 
     default:
-      throw new Exception('Unknown action');
+      throw new Exception('Unknown action: ' . $action);
   }
 } catch (Exception $e) {
   echo json_encode([
