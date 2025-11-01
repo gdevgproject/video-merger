@@ -72,6 +72,30 @@ class VideoMerger
     return null;
   }
 
+  /**
+   * Validate video file - check if readable and has valid duration
+   */
+  private function isValidVideo($videoPath)
+  {
+    if (!file_exists($videoPath)) {
+      return false;
+    }
+
+    $fileSize = filesize($videoPath);
+    if ($fileSize < 1024) { // File nhỏ hơn 1KB = invalid
+      $this->log("  ⚠️ File quá nhỏ: " . $this->formatBytes($fileSize));
+      return false;
+    }
+
+    $duration = $this->getVideoDuration($videoPath);
+    if ($duration <= 0) {
+      $this->log("  ⚠️ Không đọc được duration hoặc duration = 0");
+      return false;
+    }
+
+    return true;
+  }
+
   public function scanFiles()
   {
     $this->log("=== BẮT ĐẦU QUÉT FILES THÔNG MINH ===");
@@ -91,6 +115,7 @@ class VideoMerger
     $srt_en = [];
     $srt_vi = [];
     $srt_unknown = [];
+    $skippedVideos = [];
 
     foreach ($files as $file) {
       if ($file === '.' || $file === '..') continue;
@@ -103,14 +128,23 @@ class VideoMerger
 
       // Quét video MP4
       if ($ext === 'mp4') {
+        // Hỗ trợ nhiều pattern: 001, 01, 1
         if (preg_match('/^(\d+)/', $file, $matches)) {
           $order = intval($matches[1]);
-          $videos[$order] = [
-            'file' => $file,
-            'order' => $order,
-            'path' => $filePath
-          ];
-          $this->log("Video tìm thấy: [$order] $file");
+
+          // Validate video trước khi add
+          $this->log("Kiểm tra video: $file");
+          if ($this->isValidVideo($filePath)) {
+            $videos[$order] = [
+              'file' => $file,
+              'order' => $order,
+              'path' => $filePath
+            ];
+            $this->log("  ✓ Video hợp lệ: [$order] $file");
+          } else {
+            $skippedVideos[] = $file;
+            $this->log("  ✗ SKIP video lỗi: $file");
+          }
         }
       }
       // Quét SRT thông minh
@@ -159,9 +193,20 @@ class VideoMerger
     ksort($srt_vi);
     ksort($srt_unknown);
 
-    $this->log("Tổng: " . count($videos) . " videos, " . count($srt_en) . " SRT EN, " .
+    if (!empty($skippedVideos)) {
+      $this->log("⚠️ CẢNH BÁO: Đã bỏ qua " . count($skippedVideos) . " video lỗi:");
+      foreach ($skippedVideos as $skipped) {
+        $this->log("  - $skipped");
+      }
+    }
+
+    $this->log("Tổng: " . count($videos) . " videos hợp lệ, " . count($srt_en) . " SRT EN, " .
       count($srt_vi) . " SRT VI, " . count($srt_unknown) . " SRT unknown");
     $this->log("=== KẾT THÚC QUÉT FILES ===\n");
+
+    if (empty($videos)) {
+      throw new Exception("Không tìm thấy video hợp lệ nào để gộp!");
+    }
 
     $srt_all = [];
     foreach ($srt_en as $order => $data) {
@@ -184,7 +229,8 @@ class VideoMerger
         'vi' => count($srt_vi),
         'unknown' => count($srt_unknown),
         'total' => count($srt_en) + count($srt_vi) + count($srt_unknown)
-      ]
+      ],
+      'skipped' => $skippedVideos
     ];
   }
 
@@ -236,35 +282,45 @@ class VideoMerger
       throw new Exception("Không có video để gộp");
     }
 
-    // Tính tổng thời lượng
+    // Validate và tính tổng thời lượng
     $totalDuration = 0;
+    $validVideos = [];
+
     foreach ($videoFiles as $video) {
       $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $video;
-      if (file_exists($videoPath)) {
-        $duration = $this->getVideoDuration($videoPath);
-        $totalDuration += $duration;
-        $this->log("Video: $video - Duration: " . round($duration, 2) . "s");
-      }
-    }
-    $this->log("Tổng thời lượng video: " . round($totalDuration, 2) . "s");
 
-    // Tạo file list
+      if (!file_exists($videoPath)) {
+        $this->log("⚠️ SKIP: File không tồn tại: $videoPath");
+        continue;
+      }
+
+      $duration = $this->getVideoDuration($videoPath);
+
+      if ($duration <= 0) {
+        $this->log("⚠️ SKIP: Video lỗi hoặc duration = 0: $video");
+        continue;
+      }
+
+      $validVideos[] = $video;
+      $totalDuration += $duration;
+      $this->log("✓ Video: $video - Duration: " . round($duration, 2) . "s");
+    }
+
+    if (empty($validVideos)) {
+      throw new Exception("Không có video hợp lệ để gộp sau khi kiểm tra!");
+    }
+
+    $this->log("Tổng thời lượng video: " . round($totalDuration, 2) . "s (" . count($validVideos) . " videos)");
+
+    // Tạo file list chỉ với video hợp lệ
     $listFile = $this->outputPath . DIRECTORY_SEPARATOR . 'filelist.txt';
     $listContent = '';
 
-    foreach ($videoFiles as $video) {
+    foreach ($validVideos as $video) {
       $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $video;
-      if (!file_exists($videoPath)) {
-        $this->log("CẢNH BÁO: File không tồn tại: $videoPath");
-        continue;
-      }
       $escapedPath = str_replace('\\', '/', $videoPath);
       $listContent .= "file '" . addslashes($escapedPath) . "'\n";
       $this->log("Thêm vào danh sách: $video");
-    }
-
-    if (empty($listContent)) {
-      throw new Exception("Không có video hợp lệ để gộp");
     }
 
     file_put_contents($listFile, $listContent);
@@ -289,7 +345,7 @@ class VideoMerger
       'encoder' => 'FFmpeg with libx264'
     ];
 
-    // Lệnh FFmpeg - GIỮ NGUYÊN TỐC ĐỘ GỐC (không có setpts và atempo)
+    // Lệnh FFmpeg - GIỮ NGUYÊN TỐC ĐỘ GỐC
     $command = sprintf(
       '"%s" -f concat -safe 0 -i "%s" ' .
         '-metadata title="%s" -metadata author="%s" -metadata artist="%s" ' .
@@ -338,9 +394,15 @@ class VideoMerger
       stream_set_blocking($pipes[2], false);
 
       $lastProgress = 0;
+      $errorOutput = '';
+
       while (!feof($pipes[1]) || !feof($pipes[2])) {
         $output = fgets($pipes[1]);
         $error = fgets($pipes[2]);
+
+        if ($error) {
+          $errorOutput .= $error;
+        }
 
         // Parse FFmpeg progress
         if ($output && preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
@@ -362,23 +424,30 @@ class VideoMerger
       fclose($pipes[1]);
       fclose($pipes[2]);
       $returnCode = proc_close($process);
+
+      // Log error output nếu có
+      if (!empty($errorOutput)) {
+        $this->log("FFmpeg stderr:\n" . $errorOutput);
+      }
     } else {
       exec($command, $output, $returnCode);
+      $this->log("Exec output:\n" . implode("\n", $output));
     }
 
     $endTime = microtime(true);
     $processingTime = round($endTime - $startTime, 2);
     $this->log("Thời gian xử lý: {$processingTime}s");
+    $this->log("FFmpeg return code: $returnCode");
 
     @unlink($listFile);
     @unlink($this->processIdFile);
 
     if ($returnCode !== 0) {
-      throw new Exception("Lỗi khi gộp video (return code: $returnCode)");
+      throw new Exception("FFmpeg failed with return code: $returnCode. Check merge_log.txt for details.");
     }
 
     if (!file_exists($outputVideo)) {
-      throw new Exception("File video output không được tạo");
+      throw new Exception("File video output không được tạo. Check merge_log.txt for details.");
     }
 
     $fileSize = filesize($outputVideo);
@@ -391,6 +460,24 @@ class VideoMerger
 
   private function getVideoDuration($videoPath)
   {
+    // Sử dụng ffprobe để lấy duration chính xác hơn
+    $ffprobePath = str_replace('ffmpeg.exe', 'ffprobe.exe', FFMPEG_PATH);
+
+    if (file_exists($ffprobePath)) {
+      $command = sprintf(
+        '"%s" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%s" 2>&1',
+        $ffprobePath,
+        $videoPath
+      );
+
+      exec($command, $output, $returnCode);
+
+      if ($returnCode === 0 && !empty($output[0]) && is_numeric($output[0])) {
+        return floatval($output[0]);
+      }
+    }
+
+    // Fallback: dùng ffmpeg -i
     $command = sprintf(
       '"%s" -i "%s" 2>&1',
       FFMPEG_PATH,
@@ -407,6 +494,7 @@ class VideoMerger
         return $hours * 3600 + $minutes * 60 + $seconds;
       }
     }
+
     return 0;
   }
 
@@ -449,12 +537,18 @@ class VideoMerger
         $subtitleCounter++;
       }
 
-      // Cập nhật offset với thời lượng video GỐC (không speed)
+      // Cập nhật offset với thời lượng video tương ứng
       if (isset($videoFiles[$index])) {
         $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $videoFiles[$index];
-        $duration = $this->getVideoDuration($videoPath);
-        $timeOffset += $duration;
-        $this->log("  - Cộng dồn offset: +" . round($duration, 3) . "s = " . round($timeOffset, 3) . "s");
+        if (file_exists($videoPath)) {
+          $duration = $this->getVideoDuration($videoPath);
+          if ($duration > 0) {
+            $timeOffset += $duration;
+            $this->log("  - Cộng dồn offset: +" . round($duration, 3) . "s = " . round($timeOffset, 3) . "s");
+          } else {
+            $this->log("  - CẢNH BÁO: Video duration = 0, không cộng offset");
+          }
+        }
       }
     }
 
@@ -574,6 +668,7 @@ try {
         'success' => true,
         'files' => $files,
         'srt_info' => $files['srt_info'],
+        'skipped' => $files['skipped'] ?? [],
         'processId' => uniqid('proc_', true)
       ]);
       break;
