@@ -3,7 +3,6 @@ header('Content-Type: application/json');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 
-// ===== ULTRA PERFORMANCE CONFIGURATION =====
 set_time_limit(0);
 ini_set('max_execution_time', '0');
 ini_set('memory_limit', '8G');
@@ -14,8 +13,8 @@ define('FFMPEG_PATH', 'C:\\ooxmind\\bin\\ffmpeg\\bin\\ffmpeg.exe');
 define('FFPROBE_PATH', 'C:\\ooxmind\\bin\\ffmpeg\\bin\\ffprobe.exe');
 define('MAX_RETRIES', 3);
 define('PROGRESS_UPDATE_INTERVAL', 0.5);
-define('VIDEO_TIMEOUT', 28800); // 8 hours for large videos
-define('STUCK_THRESHOLD', 600); // 10 minutes no output = stuck
+define('VIDEO_TIMEOUT', 28800);
+define('STUCK_THRESHOLD', 120); // Reduce to 2 minutes for faster detection
 
 class VideoMergerUltraV2
 {
@@ -25,32 +24,74 @@ class VideoMergerUltraV2
   private $logFile;
   private $progressFile;
   private $processIdFile;
+  private $tempPathFile;
+  private $errorLogFile;
+  private $ffmpegLogFile; // NEW: Separate FFmpeg output file
   private $currentProcessPid = null;
   private $lastProgressUpdate = 0;
   private $logBuffer = [];
   private $logBufferSize = 50;
   private $outputVideoPath = '';
   private $sanitizationMap = [];
-  private $shouldCleanup = false; // CRITICAL: Control cleanup behavior
+  private $shouldCleanup = false;
+  private $silentMode = false;
 
-  public function __construct($inputPath, $outputPath)
+  public function __construct($inputPath, $outputPath, $loadExistingTemp = true, $silentMode = false)
   {
+    $this->silentMode = $silentMode;
     $this->inputPath = rtrim($inputPath, '\\/');
     $this->outputPath = rtrim($outputPath, '\\/');
-    $this->tempWorkPath = $this->outputPath . DIRECTORY_SEPARATOR . '_temp_work_' . uniqid();
     $this->logFile = $this->outputPath . DIRECTORY_SEPARATOR . 'merge_log.txt';
+    $this->errorLogFile = $this->outputPath . DIRECTORY_SEPARATOR . 'error_log.txt';
+    $this->ffmpegLogFile = $this->outputPath . DIRECTORY_SEPARATOR . 'ffmpeg_output.txt';
     $this->progressFile = $this->outputPath . DIRECTORY_SEPARATOR . 'progress.json';
     $this->processIdFile = $this->outputPath . DIRECTORY_SEPARATOR . 'process_id.txt';
+    $this->tempPathFile = $this->outputPath . DIRECTORY_SEPARATOR . 'temp_path.txt';
+
+    if ($loadExistingTemp && file_exists($this->tempPathFile)) {
+      $savedPath = @file_get_contents($this->tempPathFile);
+      if ($savedPath && is_dir($savedPath)) {
+        $this->tempWorkPath = trim($savedPath);
+        if (!$silentMode) {
+          $this->log("📂 Loaded existing temp path: {$this->tempWorkPath}");
+        }
+      } else {
+        $this->tempWorkPath = $this->outputPath . DIRECTORY_SEPARATOR . '_temp_work_' . uniqid();
+      }
+    } else {
+      $this->tempWorkPath = $this->outputPath . DIRECTORY_SEPARATOR . '_temp_work_' . uniqid();
+    }
+  }
+
+  private function saveTempPath()
+  {
+    if (!@file_put_contents($this->tempPathFile, $this->tempWorkPath, LOCK_EX)) {
+      $this->log("⚠️ Warning: Cannot save temp path to file");
+    } else {
+      $this->log("💾 Saved temp path: {$this->tempWorkPath}");
+    }
   }
 
   private function log($message, $forceWrite = false)
   {
+    if ($this->silentMode && !$forceWrite) {
+      return;
+    }
+
     $timestamp = date('Y-m-d H:i:s');
     $this->logBuffer[] = "[$timestamp] $message";
 
     if (count($this->logBuffer) >= $this->logBufferSize || $forceWrite) {
       $this->flushLogs();
     }
+  }
+
+  private function logError($message, $forceWrite = true)
+  {
+    $timestamp = date('Y-m-d H:i:s');
+    $errorMsg = "[$timestamp] ERROR: $message\n";
+    @file_put_contents($this->errorLogFile, $errorMsg, FILE_APPEND | LOCK_EX);
+    $this->log("❌ ERROR: $message", $forceWrite);
   }
 
   private function flushLogs()
@@ -64,52 +105,34 @@ class VideoMergerUltraV2
   public function __destruct()
   {
     $this->flushLogs();
-
-    // ONLY cleanup if explicitly set
     if ($this->shouldCleanup) {
       $this->cleanupTempFolder();
     }
   }
 
-  // ===== AGGRESSIVE FILE NAME SANITIZATION =====
   private function aggressiveSanitize($filename)
   {
-    // Get extension first
     $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
     $nameWithoutExt = pathinfo($filename, PATHINFO_FILENAME);
-
-    // Remove BOM
     $nameWithoutExt = preg_replace('/^\xEF\xBB\xBF/', '', $nameWithoutExt);
-
-    // Remove ALL emojis and unicode symbols
     $nameWithoutExt = preg_replace('/[\x{1F000}-\x{1FFFF}]/u', '', $nameWithoutExt);
     $nameWithoutExt = preg_replace('/[\x{2600}-\x{26FF}]/u', '', $nameWithoutExt);
     $nameWithoutExt = preg_replace('/[\x{2700}-\x{27BF}]/u', '', $nameWithoutExt);
     $nameWithoutExt = preg_replace('/[\x{FE00}-\x{FE0F}]/u', '', $nameWithoutExt);
-
-    // ONLY keep: a-z, A-Z, 0-9, underscore, dash, dot
-    // Replace everything else with underscore
     $nameWithoutExt = preg_replace('/[^a-zA-Z0-9_\-.]/', '_', $nameWithoutExt);
-
-    // Replace multiple underscores/dashes with single one
     $nameWithoutExt = preg_replace('/[_-]+/', '_', $nameWithoutExt);
-
-    // Remove leading/trailing underscores, dashes, dots
     $nameWithoutExt = trim($nameWithoutExt, '_-. ');
 
-    // If empty after sanitization, generate unique name
     if (empty($nameWithoutExt) || $nameWithoutExt === '') {
       $nameWithoutExt = 'file_' . uniqid() . '_' . time();
     }
 
-    // Limit length
     if (strlen($nameWithoutExt) > 150) {
       $nameWithoutExt = substr($nameWithoutExt, 0, 150);
     }
 
     $sanitized = $nameWithoutExt . '.' . $extension;
 
-    // Final check: ensure no problematic characters remain
     if (preg_match('/[^a-zA-Z0-9_\-.]/', $sanitized)) {
       $this->log("WARNING: Sanitization failed for: $filename, using fallback");
       $sanitized = 'file_' . md5($filename) . '.' . $extension;
@@ -125,6 +148,9 @@ class VideoMergerUltraV2
         throw new Exception("Cannot create temp work folder: {$this->tempWorkPath}");
       }
       $this->log("✅ Created temp work folder: {$this->tempWorkPath}");
+      $this->saveTempPath();
+    } else {
+      $this->log("📂 Temp folder already exists: {$this->tempWorkPath}");
     }
     return true;
   }
@@ -135,7 +161,7 @@ class VideoMergerUltraV2
       return;
     }
 
-    $this->log("🧹 Cleaning up temp folder...");
+    $this->log("🧹 Cleaning up temp folder...", true);
 
     $files = glob($this->tempWorkPath . DIRECTORY_SEPARATOR . '*');
     $deleted = 0;
@@ -149,17 +175,20 @@ class VideoMergerUltraV2
     }
 
     @rmdir($this->tempWorkPath);
-    $this->log("✅ Deleted $deleted temp files, removed temp folder");
+
+    if (file_exists($this->tempPathFile)) {
+      @unlink($this->tempPathFile);
+    }
+
+    $this->log("✅ Deleted $deleted temp files, removed temp folder", true);
   }
 
-  // Manual cleanup method for explicit calls
   public function forceCleanup()
   {
     $this->shouldCleanup = true;
     $this->cleanupTempFolder();
   }
 
-  // ===== VALIDATE FFMPEG =====
   private function validateFFmpeg()
   {
     if (!file_exists(FFMPEG_PATH)) {
@@ -178,31 +207,13 @@ class VideoMergerUltraV2
     return true;
   }
 
-  // ===== ENHANCED PROCESS CONTROL =====
   private function killAllFFmpegProcesses()
   {
     $this->log("🔪 Killing all FFmpeg processes...");
-
-    // Method 1: taskkill with force
     exec('taskkill /F /IM ffmpeg.exe /T 2>&1', $output1);
     $this->log("Taskkill result: " . implode("; ", $output1));
-
-    // Method 2: WMIC (more reliable on Windows 11)
     exec('wmic process where name="ffmpeg.exe" delete 2>&1', $output2);
-
     sleep(2);
-
-    // Verify
-    exec('tasklist /FI "IMAGENAME eq ffmpeg.exe" 2>&1', $checkOutput);
-    $stillRunning = stripos(implode("\n", $checkOutput), 'ffmpeg.exe') !== false;
-
-    if (!$stillRunning) {
-      $this->log("✅ All FFmpeg processes terminated");
-    } else {
-      $this->log("⚠️ Some FFmpeg processes may still be running, trying harder...");
-      exec('taskkill /F /FI "IMAGENAME eq ffmpeg.exe" 2>&1');
-      sleep(1);
-    }
   }
 
   private function updateProgress($progress, $status = '', $currentTime = 0, $totalDuration = 0)
@@ -243,7 +254,6 @@ class VideoMergerUltraV2
   {
     $this->log("🛑 Initiating process termination...", true);
 
-    // Kill by saved PID
     if (file_exists($this->processIdFile)) {
       $pid = @file_get_contents($this->processIdFile);
       if ($pid && is_numeric($pid)) {
@@ -254,10 +264,7 @@ class VideoMergerUltraV2
       @unlink($this->processIdFile);
     }
 
-    // Kill all FFmpeg as backup
     $this->killAllFFmpegProcesses();
-
-    // Cleanup
     @unlink($this->progressFile);
     $this->shouldCleanup = true;
     $this->cleanupTempFolder();
@@ -271,7 +278,6 @@ class VideoMergerUltraV2
       if ($content) {
         $data = json_decode($content, true);
 
-        // Check for stalled process
         if (isset($data['timestamp']) && (time() - $data['timestamp']) > STUCK_THRESHOLD) {
           return [
             'progress' => $data['progress'] ?? 0,
@@ -281,7 +287,6 @@ class VideoMergerUltraV2
           ];
         }
 
-        // Update file size if path provided
         if (!empty($outputPath) && !empty($outputName)) {
           $videoPath = $outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
           if (file_exists($videoPath)) {
@@ -305,7 +310,7 @@ class VideoMergerUltraV2
       return true;
     }
 
-    $required = $estimatedSize * 2; // 2x buffer for temp files
+    $required = $estimatedSize * 2;
     $freeGB = $freeSpace / (1024 * 1024 * 1024);
     $requiredGB = $required / (1024 * 1024 * 1024);
 
@@ -359,7 +364,6 @@ class VideoMergerUltraV2
     return $duration > 0;
   }
 
-  // ===== SCAN AND SANITIZE =====
   public function scanFiles()
   {
     $this->log("=== 🚀 ULTRA SCAN WITH AGGRESSIVE SANITIZATION ===", true);
@@ -377,8 +381,6 @@ class VideoMergerUltraV2
 
     $this->validateFFmpeg();
     $this->createTempWorkFolder();
-
-    // DO NOT set shouldCleanup here - temp folder must persist after scan
     $this->log("🔒 Temp folder will persist for merge operations");
 
     $files = scandir($this->inputPath);
@@ -401,8 +403,6 @@ class VideoMergerUltraV2
       if (!is_file($originalPath)) continue;
 
       $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-
-      // Sanitize filename
       $sanitizedName = $this->aggressiveSanitize($file);
       $needsSanitization = ($sanitizedName !== $file);
 
@@ -411,13 +411,9 @@ class VideoMergerUltraV2
         $this->log("🧹 Sanitize: '$file' → '$sanitizedName'");
       }
 
-      // Store mapping
       $this->sanitizationMap[$file] = $sanitizedName;
-
-      // Copy to temp folder
       $tempPath = $this->tempWorkPath . DIRECTORY_SEPARATOR . $sanitizedName;
 
-      // Skip if already exists (duplicate sanitized name)
       if (file_exists($tempPath)) {
         $this->log("⚠️ SKIP duplicate: $sanitizedName (already exists in temp)");
         continue;
@@ -430,7 +426,6 @@ class VideoMergerUltraV2
 
       $nameWithoutExt = pathinfo($sanitizedName, PATHINFO_FILENAME);
 
-      // Process videos
       if ($ext === 'mp4') {
         if (preg_match('/^(\d+)/', $nameWithoutExt, $matches)) {
           $order = intval($matches[1]);
@@ -461,9 +456,7 @@ class VideoMergerUltraV2
             $this->log("  ✗ SKIPPED: $file (invalid video)");
           }
         }
-      }
-      // Process SRT files
-      elseif ($ext === 'srt') {
+      } elseif ($ext === 'srt') {
         $isEnglish = preg_match('/_en$/i', $nameWithoutExt);
         $isVietnamese = preg_match('/_vi$/i', $nameWithoutExt);
 
@@ -504,7 +497,6 @@ class VideoMergerUltraV2
           }
         }
       } else {
-        // Not video/srt, delete from temp
         @unlink($tempPath);
       }
     }
@@ -521,9 +513,8 @@ class VideoMergerUltraV2
 
     $this->checkDiskSpace($totalSize);
 
-    // Verify temp files exist after scan
     $tempFileCount = count(glob($this->tempWorkPath . DIRECTORY_SEPARATOR . '*.mp4'));
-    $this->log("🔍 Verification: $tempFileCount MP4 files in temp folder");
+    $this->log("📊 Verification: $tempFileCount MP4 files in temp folder");
 
     if ($tempFileCount === 0) {
       throw new Exception("Temp folder is empty after scan! Something deleted the files.");
@@ -559,6 +550,7 @@ class VideoMergerUltraV2
       'skipped' => $skippedVideos,
       'total_duration' => $totalDuration,
       'estimated_size' => $totalSize * 1.1,
+      'temp_path' => $this->tempWorkPath,
       'stats' => [
         'total_size' => $this->formatBytes($totalSize),
         'total_duration' => $this->formatTime(round($totalDuration)),
@@ -569,13 +561,11 @@ class VideoMergerUltraV2
     ];
   }
 
-  // ===== MERGE SRT =====
   public function mergeAllSRT($srtData, $videoData, $outputName = 'merged_output')
   {
     $this->log("=== 📝 MERGING ALL SRT ===");
 
     $outputName = $this->aggressiveSanitize($outputName);
-
     $srt_by_type = ['en' => [], 'vi' => [], 'unknown' => []];
 
     foreach ($srtData as $srt) {
@@ -600,14 +590,21 @@ class VideoMergerUltraV2
   public function mergeSRT($srtData, $videoData, $outputName = 'merged_output', $lang = 'en')
   {
     $this->log("=== 📝 MERGING SRT ($lang) ===");
-
     if (empty($srtData)) {
       throw new Exception("No SRT files to merge");
     }
 
+    // --- OPTIMIZATION: Pre-calculate cumulative duration offsets ---
+    $videoOffsets = [];
+    $cumulativeDuration = 0;
+    foreach ($videoData as $video) {
+      $videoOffsets[$video['order']] = $cumulativeDuration;
+      $cumulativeDuration += $video['duration'];
+    }
+    // --- END OPTIMIZATION ---
+
     $mergedContent = '';
     $subtitleCounter = 1;
-    $timeOffset = 0;
 
     foreach ($srtData as $srtItem) {
       $srtPath = $srtItem['path'];
@@ -623,8 +620,10 @@ class VideoMergerUltraV2
         continue;
       }
 
-      $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
+      // Use the pre-calculated offset.
+      $timeOffset = $videoOffsets[$srtItem['order']] ?? 0;
 
+      $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
       $subtitles = $this->parseSRT($content);
       $this->log("  ✅ " . $srtItem['file'] . ": " . count($subtitles) . " subs (offset: " . round($timeOffset, 2) . "s)");
 
@@ -632,19 +631,9 @@ class VideoMergerUltraV2
         $startTime = $this->addTimeOffset($subtitle['start'], $timeOffset);
         $endTime = $this->addTimeOffset($subtitle['end'], $timeOffset);
 
-        $mergedContent .= $subtitleCounter . "\n";
+        $mergedContent .= $subtitleCounter++ . "\n";
         $mergedContent .= $startTime . ' --> ' . $endTime . "\n";
         $mergedContent .= $subtitle['text'] . "\n\n";
-
-        $subtitleCounter++;
-      }
-
-      $order = $srtItem['order'];
-      foreach ($videoData as $video) {
-        if ($video['order'] == $order) {
-          $timeOffset += $video['duration'];
-          break;
-        }
       }
     }
 
@@ -671,7 +660,7 @@ class VideoMergerUltraV2
       if (empty($block)) continue;
 
       $lines = explode("\n", $block);
-      if (count($lines) < 3) continue;
+      if (count($lines) < 2) continue; // Changed to 2 to be more lenient
 
       $timelineLine = $lines[1] ?? '';
 
@@ -706,7 +695,6 @@ class VideoMergerUltraV2
     return $timestamp;
   }
 
-  // ===== MERGE VIDEOS =====
   public function mergeVideos($videoData, $outputName = 'merged_output', $totalDuration = 0)
   {
     $this->log("=== 🎥 ULTRA FAST VIDEO MERGE STARTED ===", true);
@@ -718,16 +706,15 @@ class VideoMergerUltraV2
       throw new Exception("No videos to merge");
     }
 
-    // Verify temp folder still exists
     if (!is_dir($this->tempWorkPath)) {
       throw new Exception("Temp work folder not found! Path: {$this->tempWorkPath}");
     }
 
     $tempFileCount = count(glob($this->tempWorkPath . DIRECTORY_SEPARATOR . '*.mp4'));
-    $this->log("🔍 Pre-merge verification: $tempFileCount MP4 files in temp folder");
+    $this->log("📊 Pre-merge verification: $tempFileCount MP4 files in temp folder");
 
     if ($tempFileCount === 0) {
-      throw new Exception("Temp folder is empty before merge! All files were deleted somehow.");
+      throw new Exception("Temp folder is empty before merge!");
     }
 
     $validVideos = [];
@@ -737,18 +724,8 @@ class VideoMergerUltraV2
       $videoPath = $video['path'];
 
       if (!file_exists($videoPath)) {
-        $this->log("⚠️ SKIP: File not found: " . $video['file'] . " at " . $videoPath);
-
-        // Try to find in temp folder by filename
-        $filename = basename($videoPath);
-        $altPath = $this->tempWorkPath . DIRECTORY_SEPARATOR . $filename;
-
-        if (file_exists($altPath)) {
-          $this->log("  ✓ Found alternative path: $altPath");
-          $videoPath = $altPath;
-        } else {
-          continue;
-        }
+        $this->log("⚠️ SKIP: File not found: " . $video['file']);
+        continue;
       }
 
       $duration = $video['duration'] ?? $this->getVideoDuration($videoPath);
@@ -768,7 +745,7 @@ class VideoMergerUltraV2
     }
 
     if (empty($validVideos)) {
-      throw new Exception("No valid videos found after validation! Check temp folder: {$this->tempWorkPath}");
+      throw new Exception("No valid videos found after validation!");
     }
 
     $totalDuration = $totalDuration > 0 ? $totalDuration : $calculatedDuration;
@@ -779,16 +756,16 @@ class VideoMergerUltraV2
 
     foreach ($validVideos as $video) {
       $videoPath = $video['path'];
-      $normalizedPath = str_replace('/', '\\', $videoPath);
-      $escapedPath = str_replace("'", "'\\''", $normalizedPath);
-      $listContent .= "file '$escapedPath'\n";
+      $unixPath = str_replace('\\', '/', $videoPath);
+      $listContent .= "file '$unixPath'\n";
     }
 
     if (!@file_put_contents($listFile, $listContent, LOCK_EX)) {
       throw new Exception("Cannot create filelist: $listFile");
     }
 
-    $this->log("📄 Filelist created: $listFile");
+    $this->log("📄 Filelist created with Unix paths");
+    $this->log("📄 Sample: " . substr($listContent, 0, 200));
 
     $outputVideo = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
     $this->outputVideoPath = $outputVideo;
@@ -800,170 +777,111 @@ class VideoMergerUltraV2
 
     $this->updateProgress(0.1, 'starting', 0, $totalDuration);
 
+    $ffmpegOutputFile = $this->ffmpegLogFile;
+
+    // --- IMPROVED & ROBUST COMMAND ---
     $command = sprintf(
-      '"%s" -f concat -safe 0 -i "%s" ' .
-        '-c copy ' .
-        '-fflags +genpts ' .
-        '-avoid_negative_ts make_zero ' .
-        '-max_muxing_queue_size 9999 ' .
-        '-analyzeduration 100M -probesize 100M ' .
-        '-metadata title="%s" ' .
-        '-movflags +faststart ' .
-        '-progress pipe:1 -y "%s" 2>&1',
+      '"%s" -f concat -safe 0 -i "%s" -c copy -avoid_negative_ts make_zero -max_muxing_queue_size 9999 -movflags +faststart -y "%s" > "%s" 2>&1',
       FFMPEG_PATH,
-      $listFile,
-      addslashes($outputName),
-      $outputVideo
+      str_replace('\\', '/', $listFile),
+      str_replace('\\', '/', $outputVideo),
+      str_replace('\\', '/', $ffmpegOutputFile)
     );
 
     $this->log("🚀 FFmpeg command:");
     $this->log($command, true);
+    $this->log("📝 FFmpeg output will be saved to: $ffmpegOutputFile");
 
-    $descriptorspec = [
-      0 => ["pipe", "r"],
-      1 => ["pipe", "w"],
-      2 => ["pipe", "w"]
-    ];
+    $startTime = time();
 
-    $process = proc_open($command, $descriptorspec, $pipes);
+    // --- CRITICAL FIX for Windows background execution ---
+    // Add an empty quoted string "" as a dummy title for the 'start' command.
+    exec('start /B "" ' . $command, $execOutput, $returnCode);
 
-    if (!is_resource($process)) {
-      throw new Exception("Cannot start FFmpeg process");
-    }
+    $this->log("📢 FFmpeg started in background, return code: $returnCode");
 
-    $status = proc_get_status($process);
-    if ($status && isset($status['pid'])) {
-      $this->saveProcessPid($status['pid']);
-    } else {
-      throw new Exception("Cannot get FFmpeg PID");
-    }
-
-    stream_set_blocking($pipes[1], false);
-    stream_set_blocking($pipes[2], false);
-
-    $lastProgress = 0;
-    $errorOutput = '';
-    $lastHeartbeat = time();
-    $progressStartTime = microtime(true);
-    $lastLogTime = 0;
-    $lastOutputTime = time();
+    $lastFileSize = 0;
+    $noGrowthCount = 0;
+    $lastLogTime = time();
 
     while (true) {
-      $status = proc_get_status($process);
+      sleep(1);
 
-      if (!$status['running']) {
+      if (file_exists($outputVideo)) {
+        clearstatcache(true, $outputVideo); // Clear file stat cache
+        $currentSize = filesize($outputVideo);
+
+        if ($currentSize > $lastFileSize) {
+          $lastFileSize = $currentSize;
+          $noGrowthCount = 0;
+
+          $progress = 0;
+          if ($totalDuration > 0 && $currentSize > 0) {
+            $estimatedSeconds = $currentSize / 102400; // Rough estimate
+            $progress = min(($estimatedSeconds / $totalDuration) * 100, 99.5);
+          }
+
+          if (time() - $lastLogTime >= 15) {
+            $sizeMB = round($currentSize / (1024 * 1024), 2);
+            $this->log("💗 Progress: {$progress}% - Size: {$sizeMB}MB");
+            $lastLogTime = time();
+          }
+
+          $this->updateProgress($progress, 'encoding', 0, $totalDuration);
+        } else {
+          $noGrowthCount++;
+        }
+      }
+
+      $elapsed = time() - $startTime;
+
+      if ($noGrowthCount > 120) {
+        $this->log("⚠️ File size not growing for 2 minutes");
         break;
       }
 
-      if (time() - $lastHeartbeat >= 30) {
-        $elapsed = round(microtime(true) - $progressStartTime);
-        $fileSize = file_exists($outputVideo) ? filesize($outputVideo) : 0;
-        $fileSizeMB = round($fileSize / (1024 * 1024), 2);
-        $this->log("💗 Processing... " . round($lastProgress, 1) . "% ({$elapsed}s, {$fileSizeMB}MB)");
-        $lastHeartbeat = time();
-        $this->updateProgress($lastProgress, 'encoding', 0, $totalDuration);
+      if ($elapsed > VIDEO_TIMEOUT) {
+        $this->log("⚠️ TIMEOUT after {$elapsed} seconds");
+        break;
       }
 
-      $output = fgets($pipes[1]);
-      $error = fgets($pipes[2]);
+      exec('tasklist /FI "IMAGENAME eq ffmpeg.exe" 2>&1', $checkOutput);
+      $ffmpegRunning = stripos(implode("\n", $checkOutput), 'ffmpeg.exe') !== false;
 
-      if ($error !== false && $error !== '') {
-        $errorOutput .= $error;
-        $lastOutputTime = time();
-      }
-
-      if ($output !== false && $output !== '') {
-        $lastOutputTime = time();
-        $currentTime = 0;
-
-        if (preg_match('/out_time_us=(\d+)/', $output, $matches)) {
-          $currentTime = intval($matches[1]) / 1000000;
-        } elseif (preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
-          $currentTime = intval($matches[1]) / 1000;
-        } elseif (preg_match('/time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
-          $currentTime = intval($matches[1]) * 3600 + intval($matches[2]) * 60 + floatval($matches[3]);
-        }
-
-        if ($currentTime > 0 && $totalDuration > 0) {
-          $progress = min(($currentTime / $totalDuration) * 100, 99.9);
-
-          if ($progress > $lastProgress + 0.5) {
-            $this->updateProgress($progress, 'encoding', $currentTime, $totalDuration);
-            $lastProgress = $progress;
-
-            if (time() - $lastLogTime >= 15) {
-              $this->log("Progress: " . round($progress, 1) . "% (" . round($currentTime, 1) . "s / " . round($totalDuration, 1) . "s)");
-              $lastLogTime = time();
-            }
-          }
-        }
-      }
-
-      if ($output === false && $error === false) {
-        if (time() - $lastOutputTime > STUCK_THRESHOLD) {
-          $this->log("⚠️ No output from FFmpeg for " . round(STUCK_THRESHOLD / 60) . " minutes");
-
-          $currentSize = file_exists($outputVideo) ? filesize($outputVideo) : 0;
-          if ($currentSize > 0) {
-            $this->log("✅ Output exists ({$this->formatBytes($currentSize)}). Continuing...");
-            $lastOutputTime = time();
-          } else {
-            $this->log("❌ FFmpeg stuck - no output");
-            throw new Exception("FFmpeg stuck: No output for " . round(STUCK_THRESHOLD / 60) . " minutes");
-          }
-        }
-
-        usleep(50000);
-      }
-
-      if (microtime(true) - $progressStartTime > VIDEO_TIMEOUT) {
-        $this->log("⚠️ TIMEOUT: Process exceeded " . round(VIDEO_TIMEOUT / 3600) . " hours", true);
-        $this->stopCurrentProcess();
-        throw new Exception("Process timeout after " . round(VIDEO_TIMEOUT / 3600) . " hours");
+      if (!$ffmpegRunning) {
+        $this->log("✅ FFmpeg process finished");
+        break;
       }
     }
 
-    fclose($pipes[0]);
-    fclose($pipes[1]);
-    fclose($pipes[2]);
-    $returnCode = proc_close($process);
+    sleep(2);
 
     $mergeTime = round(microtime(true) - $mergeStart, 2);
-
     $this->log("⏱️ Merge time: {$mergeTime}s");
-    $this->log("📢 FFmpeg return code: $returnCode");
 
-    @unlink($this->processIdFile);
+    if (file_exists($ffmpegOutputFile)) {
+      $ffmpegOutput = @file_get_contents($ffmpegOutputFile);
+      $this->log("📝 FFmpeg output length: " . strlen($ffmpegOutput) . " bytes");
 
-    if ($returnCode !== 0) {
-      $errorLines = explode("\n", $errorOutput);
-      $relevantErrors = array_filter($errorLines, function ($line) {
-        return stripos($line, 'error') !== false || stripos($line, 'failed') !== false;
-      });
-
-      $errorMsg = "FFmpeg failed with code $returnCode";
-      if (!empty($relevantErrors)) {
-        $lastError = end($relevantErrors);
-        $errorMsg .= "\nLast error: $lastError";
+      if (stripos($ffmpegOutput, 'error') !== false || stripos($ffmpegOutput, 'invalid') !== false) {
+        $this->logError("FFmpeg reported errors. Check ffmpeg_output.txt");
+        $this->log("❌ FFmpeg errors detected in output");
       }
-      $this->log("❌ ERROR: $errorMsg", true);
-      throw new Exception($errorMsg);
     }
 
     if (!file_exists($outputVideo)) {
-      throw new Exception("Output file not created. Check merge_log.txt");
+      throw new Exception("Output file not created. Check ffmpeg_output.txt");
     }
 
     $fileSize = filesize($outputVideo);
-    if ($fileSize < 1024 * 1024) {
-      throw new Exception("Output file too small ($fileSize bytes), likely corrupted");
+    if ($fileSize < 1024 * 1024) { // 1MB minimum
+      throw new Exception("Output file too small ($fileSize bytes). Check ffmpeg_output.txt for errors.");
     }
 
     $this->log("✅ Output: $outputVideo (" . $this->formatBytes($fileSize) . ")");
     $this->updateProgress(100, 'completed', $totalDuration, $totalDuration);
     $this->log("=== VIDEO MERGE COMPLETE ===\n", true);
 
-    // NOW cleanup temp folder after successful merge
     $this->shouldCleanup = true;
     $this->cleanupTempFolder();
 
@@ -1009,7 +927,9 @@ try {
     throw new Exception('Input and output paths required');
   }
 
-  $merger = new VideoMergerUltraV2($inputPath, $outputPath);
+  $silentMode = ($action === 'get_progress');
+  $loadExistingTemp = ($action !== 'scan');
+  $merger = new VideoMergerUltraV2($inputPath, $outputPath, $loadExistingTemp, $silentMode);
 
   switch ($action) {
     case 'scan':
@@ -1021,10 +941,10 @@ try {
         'skipped' => $result['skipped'] ?? [],
         'total_duration' => $result['total_duration'],
         'estimated_size' => $result['estimated_size'],
+        'temp_path' => $result['temp_path'],
         'stats' => $result['stats'],
         'processId' => uniqid('ultra_v2_', true)
       ]);
-      // NOTE: Object will be destroyed here but temp folder persists
       break;
 
     case 'merge_all_srt':
@@ -1057,7 +977,6 @@ try {
         'output' => $result['path'],
         'output_size' => $result['size']
       ]);
-      // Temp folder cleaned up inside mergeVideos()
       break;
 
     case 'get_progress':
