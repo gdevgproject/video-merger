@@ -2,12 +2,17 @@
 header('Content-Type: application/json');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
-set_time_limit(0);
-ini_set('memory_limit', '2G');
+
+// ===== FIX #1: Tăng giới hạn thời gian và memory =====
+set_time_limit(0); // Không giới hạn thời gian
+ini_set('max_execution_time', '0');
+ini_set('memory_limit', '4G'); // Tăng lên 4GB
+ignore_user_abort(true); // Tiếp tục chạy khi user đóng browser
 
 // Đường dẫn FFmpeg
 define('FFMPEG_PATH', 'C:\\ooxmind\\bin\\ffmpeg\\bin\\ffmpeg.exe');
-define('SPEED_FACTOR', 1.0); // Giữ nguyên tốc độ gốc
+define('SPEED_FACTOR', 1.0);
+define('MAX_RETRIES', 3); // Số lần thử lại khi lỗi
 
 class VideoMerger
 {
@@ -17,6 +22,7 @@ class VideoMerger
   private $progressFile;
   private $processIdFile;
   private $currentProcessPid = null;
+  private $lastProgressUpdate = 0;
 
   public function __construct($inputPath, $outputPath)
   {
@@ -33,67 +39,103 @@ class VideoMerger
     @file_put_contents($this->logFile, "[$timestamp] $message\n", FILE_APPEND);
   }
 
+  // ===== FIX #2: Throttle progress updates để giảm I/O =====
   private function updateProgress($progress, $status = '')
   {
+    $now = microtime(true);
+    // Chỉ update mỗi 1 giây
+    if ($now - $this->lastProgressUpdate < 1 && $progress < 100) {
+      return;
+    }
+
+    $this->lastProgressUpdate = $now;
     $data = [
       'progress' => $progress,
       'status' => $status,
       'timestamp' => time()
     ];
-    @file_put_contents($this->progressFile, json_encode($data));
+    @file_put_contents($this->progressFile, json_encode($data), LOCK_EX);
   }
 
   private function saveProcessPid($pid)
   {
-    @file_put_contents($this->processIdFile, $pid);
+    @file_put_contents($this->processIdFile, $pid, LOCK_EX);
     $this->currentProcessPid = $pid;
   }
 
+  // ===== FIX #3: Cải thiện stop process - kill cả process tree =====
   public function stopCurrentProcess()
   {
     if (file_exists($this->processIdFile)) {
       $pid = @file_get_contents($this->processIdFile);
       if ($pid && is_numeric($pid)) {
-        $this->log("Đang dừng process PID: $pid");
-        // Kill FFmpeg process trên Windows
-        exec("taskkill /F /PID $pid /T 2>&1", $output);
-        $this->log("Kết quả dừng: " . implode("\n", $output));
+        $this->log("🛑 Đang dừng process PID: $pid");
+
+        // Kill process tree (bao gồm cả child processes)
+        exec("taskkill /F /PID $pid /T 2>&1", $output, $returnCode);
+        $this->log("Kill result (code $returnCode): " . implode("\n", $output));
+
+        // Đợi một chút để đảm bảo process đã chết
+        sleep(1);
+
+        // Kiểm tra xem còn process nào đang chạy không
+        exec("tasklist /FI \"PID eq $pid\" 2>&1", $checkOutput);
+        if (!preg_match("/\b$pid\b/", implode("\n", $checkOutput))) {
+          $this->log("✓ Process đã dừng hoàn toàn");
+        }
       }
       @unlink($this->processIdFile);
     }
+
+    // Xóa file progress để tránh hiển thị sai
+    @unlink($this->progressFile);
   }
 
   public function getProgress()
   {
     if (file_exists($this->progressFile)) {
-      $data = json_decode(file_get_contents($this->progressFile), true);
-      return $data;
+      $content = @file_get_contents($this->progressFile);
+      if ($content) {
+        $data = json_decode($content, true);
+        // Check timeout - nếu không update trong 30s thì coi như lỗi
+        if (isset($data['timestamp']) && (time() - $data['timestamp']) > 30) {
+          return ['progress' => 0, 'status' => 'timeout'];
+        }
+        return $data;
+      }
     }
     return null;
   }
 
-  /**
-   * Validate video file - check if readable and has valid duration
-   */
-  private function isValidVideo($videoPath)
+  // ===== FIX #4: Validate video kỹ hơn với retry =====
+  private function isValidVideo($videoPath, $retries = 2)
   {
     if (!file_exists($videoPath)) {
       return false;
     }
 
     $fileSize = filesize($videoPath);
-    if ($fileSize < 1024) { // File nhỏ hơn 1KB = invalid
+    if ($fileSize < 1024) {
       $this->log("  ⚠️ File quá nhỏ: " . $this->formatBytes($fileSize));
       return false;
     }
 
-    $duration = $this->getVideoDuration($videoPath);
-    if ($duration <= 0) {
-      $this->log("  ⚠️ Không đọc được duration hoặc duration = 0");
-      return false;
+    // Thử validate với retry
+    for ($i = 0; $i <= $retries; $i++) {
+      $duration = $this->getVideoDuration($videoPath);
+
+      if ($duration > 0) {
+        return true;
+      }
+
+      if ($i < $retries) {
+        $this->log("  ⏳ Retry validation... ($i/$retries)");
+        sleep(1);
+      }
     }
 
-    return true;
+    $this->log("  ✗ Không thể validate video sau $retries lần thử");
+    return false;
   }
 
   public function scanFiles()
@@ -105,7 +147,7 @@ class VideoMerger
     }
 
     if (!is_dir($this->outputPath)) {
-      if (!mkdir($this->outputPath, 0777, true)) {
+      if (!@mkdir($this->outputPath, 0777, true)) {
         throw new Exception("Không thể tạo thư mục output: {$this->outputPath}");
       }
     }
@@ -126,15 +168,14 @@ class VideoMerger
       $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
       $nameWithoutExt = pathinfo($file, PATHINFO_FILENAME);
 
-      // Quét video MP4
       if ($ext === 'mp4') {
-        // Hỗ trợ nhiều pattern: 001, 01, 1
         if (preg_match('/^(\d+)/', $file, $matches)) {
           $order = intval($matches[1]);
 
-          // Validate video trước khi add
-          $this->log("Kiểm tra video: $file");
-          if ($this->isValidVideo($filePath)) {
+          $this->log("🔍 Kiểm tra video: $file");
+
+          // Validate với retry
+          if ($this->isValidVideo($filePath, 2)) {
             $videos[$order] = [
               'file' => $file,
               'order' => $order,
@@ -146,9 +187,7 @@ class VideoMerger
             $this->log("  ✗ SKIP video lỗi: $file");
           }
         }
-      }
-      // Quét SRT thông minh
-      elseif ($ext === 'srt') {
+      } elseif ($ext === 'srt') {
         $isEnglish = preg_match('/_en$/i', $nameWithoutExt);
         $isVietnamese = preg_match('/_vi$/i', $nameWithoutExt);
 
@@ -161,7 +200,7 @@ class VideoMerger
               'order' => $order,
               'path' => $filePath
             ];
-            $this->log("SRT EN tìm thấy: [$order] $file");
+            $this->log("📝 SRT EN: [$order] $file");
           }
         } elseif ($isVietnamese) {
           $baseNameWithoutLang = preg_replace('/_vi$/i', '', $nameWithoutExt);
@@ -172,7 +211,7 @@ class VideoMerger
               'order' => $order,
               'path' => $filePath
             ];
-            $this->log("SRT VI tìm thấy: [$order] $file");
+            $this->log("📝 SRT VI: [$order] $file");
           }
         } else {
           if (preg_match('/^(\d+)/', $nameWithoutExt, $matches)) {
@@ -182,7 +221,7 @@ class VideoMerger
               'order' => $order,
               'path' => $filePath
             ];
-            $this->log("SRT (no lang) tìm thấy: [$order] $file");
+            $this->log("📝 SRT (no lang): [$order] $file");
           }
         }
       }
@@ -200,7 +239,7 @@ class VideoMerger
       }
     }
 
-    $this->log("Tổng: " . count($videos) . " videos hợp lệ, " . count($srt_en) . " SRT EN, " .
+    $this->log("✅ Tổng: " . count($videos) . " videos hợp lệ, " . count($srt_en) . " SRT EN, " .
       count($srt_vi) . " SRT VI, " . count($srt_unknown) . " SRT unknown");
     $this->log("=== KẾT THÚC QUÉT FILES ===\n");
 
@@ -252,28 +291,29 @@ class VideoMerger
     $merged_count = 0;
 
     if (!empty($srt_by_type['en'])) {
-      $this->log("Gộp " . count($srt_by_type['en']) . " file SRT EN");
+      $this->log("📝 Gộp " . count($srt_by_type['en']) . " file SRT EN");
       $this->mergeSRT($srt_by_type['en'], $videoFiles, $outputName, 'en');
       $merged_count++;
     }
 
     if (!empty($srt_by_type['vi'])) {
-      $this->log("Gộp " . count($srt_by_type['vi']) . " file SRT VI");
+      $this->log("📝 Gộp " . count($srt_by_type['vi']) . " file SRT VI");
       $this->mergeSRT($srt_by_type['vi'], $videoFiles, $outputName, 'vi');
       $merged_count++;
     }
 
     if (!empty($srt_by_type['unknown'])) {
-      $this->log("Gộp " . count($srt_by_type['unknown']) . " file SRT (no lang)");
+      $this->log("📝 Gộp " . count($srt_by_type['unknown']) . " file SRT (no lang)");
       $this->mergeSRT($srt_by_type['unknown'], $videoFiles, $outputName, '');
       $merged_count++;
     }
 
-    $this->log("=== HOÀN THÀNH GỘP SRT: $merged_count loại ===\n");
+    $this->log("✅ HOÀN THÀNH GỘP SRT: $merged_count loại\n");
 
     return $merged_count;
   }
 
+  // ===== FIX #5: Cải thiện merge video với error handling tốt hơn =====
   public function mergeVideos($videoFiles, $outputName = 'merged_output')
   {
     $this->log("=== BẮT ĐẦU GỘP VIDEO (TỐC ĐỘ GỐC 1.0x) ===");
@@ -282,7 +322,6 @@ class VideoMerger
       throw new Exception("Không có video để gộp");
     }
 
-    // Validate và tính tổng thời lượng
     $totalDuration = 0;
     $validVideos = [];
 
@@ -310,29 +349,33 @@ class VideoMerger
       throw new Exception("Không có video hợp lệ để gộp sau khi kiểm tra!");
     }
 
-    $this->log("Tổng thời lượng video: " . round($totalDuration, 2) . "s (" . count($validVideos) . " videos)");
+    $this->log("📊 Tổng thời lượng: " . round($totalDuration, 2) . "s (" . count($validVideos) . " videos)");
 
-    // Tạo file list chỉ với video hợp lệ
+    // ===== FIX #6: Escape path đúng cách cho Windows =====
     $listFile = $this->outputPath . DIRECTORY_SEPARATOR . 'filelist.txt';
     $listContent = '';
 
     foreach ($validVideos as $video) {
       $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $video;
-      $escapedPath = str_replace('\\', '/', $videoPath);
-      $listContent .= "file '" . addslashes($escapedPath) . "'\n";
-      $this->log("Thêm vào danh sách: $video");
+      // Normalize path cho Windows
+      $normalizedPath = str_replace('/', '\\', $videoPath);
+      // Escape single quotes trong path
+      $escapedPath = str_replace("'", "'\\''", $normalizedPath);
+      $listContent .= "file '$escapedPath'\n";
+      $this->log("📋 Add to list: $video");
     }
 
-    file_put_contents($listFile, $listContent);
+    if (!@file_put_contents($listFile, $listContent)) {
+      throw new Exception("Không thể tạo file list: $listFile");
+    }
 
     $outputVideo = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
 
     if (file_exists($outputVideo)) {
-      unlink($outputVideo);
-      $this->log("Đã xóa file output cũ");
+      @unlink($outputVideo);
+      $this->log("🗑️ Đã xóa file output cũ");
     }
 
-    // Metadata bản quyền đầy đủ
     $metadata = [
       'title' => $outputName,
       'author' => 'Video Merger Pro',
@@ -345,8 +388,7 @@ class VideoMerger
       'encoder' => 'Video Merger Pro with FFmpeg'
     ];
 
-    // Lệnh FFmpeg - DÙNG -c copy để NHANH (không re-encode)
-    // Chỉ thêm metadata mà không encode lại
+    // ===== FIX #7: Thêm error recovery và logging tốt hơn =====
     $command = sprintf(
       '"%s" -f concat -safe 0 -i "%s" ' .
         '-c copy ' .
@@ -369,12 +411,11 @@ class VideoMerger
       $outputVideo
     );
 
-    $this->log("Lệnh FFmpeg: $command");
-    $this->log("Đang xử lý video với -c copy (NHANH, không re-encode)...");
+    $this->log("🚀 FFmpeg command: $command");
+    $this->log("⏳ Đang xử lý video với -c copy (NHANH, không re-encode)...");
 
     $startTime = microtime(true);
 
-    // Sử dụng proc_open để theo dõi progress
     $descriptorspec = [
       0 => ["pipe", "r"],
       1 => ["pipe", "w"],
@@ -383,85 +424,129 @@ class VideoMerger
 
     $process = proc_open($command, $descriptorspec, $pipes);
 
-    if (is_resource($process)) {
-      // Lấy PID để có thể kill khi cần
+    if (!is_resource($process)) {
+      throw new Exception("Không thể khởi động FFmpeg process");
+    }
+
+    $status = proc_get_status($process);
+    if ($status && isset($status['pid'])) {
+      $this->saveProcessPid($status['pid']);
+      $this->log("🔢 FFmpeg PID: " . $status['pid']);
+    }
+
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    $lastProgress = 0;
+    $errorOutput = '';
+    $outputBuffer = '';
+    $lastAliveCheck = time();
+
+    // ===== FIX #8: Better process monitoring =====
+    while (true) {
       $status = proc_get_status($process);
-      if ($status && isset($status['pid'])) {
-        $this->saveProcessPid($status['pid']);
-        $this->log("FFmpeg process PID: " . $status['pid']);
+
+      // Check if process is still running
+      if (!$status['running']) {
+        $this->log("⚠️ Process stopped running");
+        break;
       }
 
-      stream_set_blocking($pipes[1], false);
-      stream_set_blocking($pipes[2], false);
+      // Heartbeat - log mỗi 10s để biết process vẫn chạy
+      if (time() - $lastAliveCheck >= 10) {
+        $this->log("💓 Process đang chạy... (progress: " . round($lastProgress, 1) . "%)");
+        $lastAliveCheck = time();
+      }
 
-      $lastProgress = 0;
-      $errorOutput = '';
+      $output = fgets($pipes[1]);
+      $error = fgets($pipes[2]);
 
-      while (!feof($pipes[1]) || !feof($pipes[2])) {
-        $output = fgets($pipes[1]);
-        $error = fgets($pipes[2]);
+      if ($error !== false && $error !== '') {
+        $errorOutput .= $error;
+      }
 
-        if ($error) {
-          $errorOutput .= $error;
-        }
+      if ($output !== false && $output !== '') {
+        $outputBuffer .= $output;
 
-        // Parse FFmpeg progress
-        if ($output && preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
+        // Parse progress
+        if (preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
           $currentTime = intval($matches[1]) / 1000000;
           if ($totalDuration > 0) {
             $progress = min(($currentTime / $totalDuration) * 100, 99);
+
+            // Update progress mỗi 0.5% để giảm I/O
             if ($progress > $lastProgress + 0.5) {
               $this->updateProgress($progress, 'encoding');
               $lastProgress = $progress;
-              $this->log("Progress: " . round($progress, 2) . "%");
             }
           }
         }
-
-        usleep(50000); // Sleep 0.05s (giảm từ 0.1s để responsive hơn)
       }
 
-      fclose($pipes[0]);
-      fclose($pipes[1]);
-      fclose($pipes[2]);
-      $returnCode = proc_close($process);
-
-      // Log error output nếu có
-      if (!empty($errorOutput)) {
-        $this->log("FFmpeg stderr:\n" . $errorOutput);
+      // Nếu không có data, sleep ngắn
+      if ($output === false && $error === false) {
+        usleep(100000); // 0.1s
       }
-    } else {
-      exec($command, $output, $returnCode);
-      $this->log("Exec output:\n" . implode("\n", $output));
+
+      // Timeout protection - nếu quá 2 giờ thì dừng
+      if (microtime(true) - $startTime > 7200) {
+        $this->log("⚠️ TIMEOUT: Quá 2 giờ, dừng process");
+        $this->stopCurrentProcess();
+        throw new Exception("Process timeout sau 2 giờ");
+      }
     }
+
+    fclose($pipes[0]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $returnCode = proc_close($process);
 
     $endTime = microtime(true);
     $processingTime = round($endTime - $startTime, 2);
-    $this->log("Thời gian xử lý: {$processingTime}s");
-    $this->log("FFmpeg return code: $returnCode");
+
+    // Log full error nếu có
+    if (!empty($errorOutput)) {
+      $this->log("📋 FFmpeg stderr:\n" . substr($errorOutput, -2000)); // Log 2000 ký tự cuối
+    }
+
+    $this->log("⏱️ Thời gian xử lý: {$processingTime}s");
+    $this->log("🔢 FFmpeg return code: $returnCode");
 
     @unlink($listFile);
     @unlink($this->processIdFile);
 
+    // ===== FIX #9: Better error handling =====
     if ($returnCode !== 0) {
-      throw new Exception("FFmpeg failed with return code: $returnCode. Check merge_log.txt for details.");
+      $errorMsg = "FFmpeg failed with return code: $returnCode";
+      if (!empty($errorOutput)) {
+        // Extract last meaningful error line
+        $errorLines = array_filter(explode("\n", $errorOutput));
+        $lastError = end($errorLines);
+        $errorMsg .= "\nLast error: $lastError";
+      }
+      $this->log("❌ ERROR: $errorMsg");
+      throw new Exception($errorMsg);
     }
 
     if (!file_exists($outputVideo)) {
-      throw new Exception("File video output không được tạo. Check merge_log.txt for details.");
+      throw new Exception("File video output không được tạo. Check merge_log.txt");
     }
 
     $fileSize = filesize($outputVideo);
-    $this->log("✓ Video output: $outputVideo (" . $this->formatBytes($fileSize) . ")");
+    if ($fileSize < 1024 * 1024) { // Nhỏ hơn 1MB = lỗi
+      throw new Exception("File output quá nhỏ ($fileSize bytes), có thể bị lỗi");
+    }
+
+    $this->log("✅ Video output: $outputVideo (" . $this->formatBytes($fileSize) . ")");
     $this->updateProgress(100, 'completed');
     $this->log("=== KẾT THÚC GỘP VIDEO ===\n");
 
     return $outputVideo;
   }
 
+  // ===== FIX #10: Improve duration detection =====
   private function getVideoDuration($videoPath)
   {
-    // Sử dụng ffprobe để lấy duration chính xác hơn
     $ffprobePath = str_replace('ffmpeg.exe', 'ffprobe.exe', FFMPEG_PATH);
 
     if (file_exists($ffprobePath)) {
@@ -473,12 +558,15 @@ class VideoMerger
 
       exec($command, $output, $returnCode);
 
-      if ($returnCode === 0 && !empty($output[0]) && is_numeric($output[0])) {
-        return floatval($output[0]);
+      if ($returnCode === 0 && !empty($output[0])) {
+        $duration = trim($output[0]);
+        if (is_numeric($duration) && $duration > 0) {
+          return floatval($duration);
+        }
       }
     }
 
-    // Fallback: dùng ffmpeg -i
+    // Fallback
     $command = sprintf(
       '"%s" -i "%s" 2>&1',
       FFMPEG_PATH,
@@ -515,17 +603,22 @@ class VideoMerger
       $srtPath = $this->inputPath . DIRECTORY_SEPARATOR . $srtFile;
 
       if (!file_exists($srtPath)) {
-        $this->log("CẢNH BÁO: File SRT không tồn tại: $srtPath");
+        $this->log("⚠️ SKIP: SRT không tồn tại: $srtPath");
         continue;
       }
 
-      $this->log("Xử lý SRT [$index]: $srtFile (offset: " . round($timeOffset, 3) . "s)");
+      $this->log("📝 Process SRT [$index]: $srtFile (offset: " . round($timeOffset, 3) . "s)");
 
-      $content = file_get_contents($srtPath);
+      $content = @file_get_contents($srtPath);
+      if ($content === false) {
+        $this->log("⚠️ SKIP: Không đọc được SRT: $srtFile");
+        continue;
+      }
+
       $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
 
       $subtitles = $this->parseSRT($content);
-      $this->log("  - Tìm thấy " . count($subtitles) . " phụ đề");
+      $this->log("  ✓ Found " . count($subtitles) . " subtitles");
 
       foreach ($subtitles as $subtitle) {
         $startTime = $this->addTimeOffset($subtitle['start'], $timeOffset);
@@ -538,16 +631,13 @@ class VideoMerger
         $subtitleCounter++;
       }
 
-      // Cập nhật offset với thời lượng video tương ứng
       if (isset($videoFiles[$index])) {
         $videoPath = $this->inputPath . DIRECTORY_SEPARATOR . $videoFiles[$index];
         if (file_exists($videoPath)) {
           $duration = $this->getVideoDuration($videoPath);
           if ($duration > 0) {
             $timeOffset += $duration;
-            $this->log("  - Cộng dồn offset: +" . round($duration, 3) . "s = " . round($timeOffset, 3) . "s");
-          } else {
-            $this->log("  - CẢNH BÁO: Video duration = 0, không cộng offset");
+            $this->log("  ⏱️ Offset: +" . round($duration, 3) . "s = " . round($timeOffset, 3) . "s");
           }
         }
       }
@@ -563,9 +653,11 @@ class VideoMerger
     $outputSRT = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . $suffix . '.srt';
 
     $bom = "\xEF\xBB\xBF";
-    file_put_contents($outputSRT, $bom . trim($mergedContent));
+    if (!@file_put_contents($outputSRT, $bom . trim($mergedContent))) {
+      throw new Exception("Không thể ghi file SRT: $outputSRT");
+    }
 
-    $this->log("SRT output: $outputSRT (" . ($subtitleCounter - 1) . " phụ đề)");
+    $this->log("✅ SRT output: $outputSRT (" . ($subtitleCounter - 1) . " subtitles)");
     $this->log("=== KẾT THÚC GỘP SRT ($lang) ===\n");
 
     return $outputSRT;
@@ -643,7 +735,7 @@ class VideoMerger
   }
 }
 
-// Xử lý request
+// ===== FIX #11: Xử lý request với error handling tốt hơn =====
 try {
   $input = json_decode(file_get_contents('php://input'), true);
 
@@ -705,7 +797,8 @@ try {
       $progress = $merger->getProgress();
       echo json_encode([
         'success' => true,
-        'progress' => $progress ? $progress['progress'] : 0
+        'progress' => $progress ? $progress['progress'] : 0,
+        'status' => $progress ? ($progress['status'] ?? 'unknown') : 'not_started'
       ]);
       break;
 
@@ -721,8 +814,10 @@ try {
       throw new Exception('Unknown action: ' . $action);
   }
 } catch (Exception $e) {
+  http_response_code(500);
   echo json_encode([
     'success' => false,
-    'error' => $e->getMessage()
+    'error' => $e->getMessage(),
+    'trace' => $e->getTraceAsString()
   ]);
 }
