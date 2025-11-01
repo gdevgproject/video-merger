@@ -163,12 +163,12 @@ class VideoMergerUltra
       if ($content) {
         $data = json_decode($content, true);
 
-        // Check timeout - increased to 120s for large files
-        if (isset($data['timestamp']) && (time() - $data['timestamp']) > 120) {
+        // Check timeout - increased to 360s (6 minutes) for large files
+        if (isset($data['timestamp']) && (time() - $data['timestamp']) > 360) {
           return [
             'progress' => $data['progress'] ?? 0,
             'status' => 'timeout',
-            'message' => 'Progress stalled for 120s',
+            'message' => 'Progress stalled for 6 minutes',
             'file_size' => $data['file_size'] ?? 0
           ];
         }
@@ -570,10 +570,13 @@ class VideoMergerUltra
     $progressStartTime = microtime(true);
     $lastLogTime = 0;
     $hasStarted = false;
+    $lastOutputTime = time();
 
-    // FIX: Wait for FFmpeg to actually start (max 10s)
+    // FIX: Wait for FFmpeg to actually start (max 30s)
     $startWaitTime = time();
-    while (!$hasStarted && (time() - $startWaitTime) < 10) {
+    $this->log("⏳ Waiting for FFmpeg to start...");
+
+    while (!$hasStarted && (time() - $startWaitTime) < 30) {
       $status = proc_get_status($process);
 
       if (!$status['running']) {
@@ -594,15 +597,23 @@ class VideoMergerUltra
 
       if ($error !== false && !empty($error)) {
         $errorOutput .= $error;
+        // Log interesting stderr lines
+        if (
+          stripos($error, 'Input #') !== false ||
+          stripos($error, 'Output #') !== false ||
+          stripos($error, 'Stream mapping') !== false
+        ) {
+          $this->log("FFmpeg: " . trim($error));
+        }
         // Check for startup errors
         if (stripos($error, 'error') !== false || stripos($error, 'invalid') !== false) {
-          $this->log("⚠️ FFmpeg startup warning: $error");
+          $this->log("⚠️ FFmpeg warning: " . trim($error));
         }
       }
 
       if ($output !== false && !empty($output)) {
         $hasStarted = true;
-        $this->log("✅ FFmpeg started successfully");
+        $this->log("✅ FFmpeg started successfully - output detected");
         $this->updateProgress(0.5, 'encoding', 0, $totalDuration);
         break;
       }
@@ -611,14 +622,13 @@ class VideoMergerUltra
     }
 
     if (!$hasStarted) {
-      fclose($pipes[0]);
-      fclose($pipes[1]);
-      fclose($pipes[2]);
-      proc_close($process);
-      throw new Exception("FFmpeg timeout: No output after 10s. Check merge_log.txt");
+      $this->log("⚠️ No progress output after 30s, but process still running. Continuing...");
+      $this->log("This is normal for large files - FFmpeg is analyzing inputs.");
+      $hasStarted = true; // Continue anyway
     }
 
     // ===== ENHANCED PROGRESS PARSING WITH MULTIPLE PATTERNS =====
+    $noProgressCount = 0;
     while (true) {
       $status = proc_get_status($process);
 
@@ -629,8 +639,13 @@ class VideoMergerUltra
       // Heartbeat logging every 30s
       if (time() - $lastHeartbeat >= 30) {
         $elapsed = round(microtime(true) - $progressStartTime);
-        $this->log("💗 Processing... " . round($lastProgress, 1) . "% ({$elapsed}s)");
+        $fileSize = file_exists($outputVideo) ? filesize($outputVideo) : 0;
+        $fileSizeMB = round($fileSize / (1024 * 1024), 2);
+        $this->log("💗 Processing... " . round($lastProgress, 1) . "% ({$elapsed}s, {$fileSizeMB}MB output)");
         $lastHeartbeat = time();
+
+        // Force progress update every heartbeat
+        $this->updateProgress($lastProgress, 'encoding', 0, $totalDuration);
       }
 
       $output = fgets($pipes[1]);
@@ -638,9 +653,18 @@ class VideoMergerUltra
 
       if ($error !== false && $error !== '') {
         $errorOutput .= $error;
+        // Log interesting lines
+        if (
+          stripos($error, 'Opening') !== false ||
+          stripos($error, 'Successfully opened') !== false
+        ) {
+          $this->log("FFmpeg: " . trim($error));
+        }
       }
 
       if ($output !== false && $output !== '') {
+        $lastOutputTime = time(); // Reset no-output timer
+        $noProgressCount = 0;
         $currentTime = 0;
 
         // Try multiple patterns for better compatibility
@@ -671,6 +695,30 @@ class VideoMergerUltra
       }
 
       if ($output === false && $error === false) {
+        $noProgressCount++;
+
+        // Check if we haven't received any output for too long
+        if (time() - $lastOutputTime > 300) { // 5 minutes with no output at all
+          $this->log("⚠️ No output from FFmpeg for 5 minutes. Checking if process is alive...");
+
+          // Check if process is still running
+          $checkStatus = proc_get_status($process);
+          if (!$checkStatus['running']) {
+            $this->log("❌ FFmpeg process died");
+            break;
+          }
+
+          // Check if output file is growing
+          $currentSize = file_exists($outputVideo) ? filesize($outputVideo) : 0;
+          if ($currentSize > 0) {
+            $this->log("✅ Output file exists ({$this->formatBytes($currentSize)}). Continuing...");
+            $lastOutputTime = time(); // Reset timer
+          } else {
+            $this->log("❌ No output file created. FFmpeg may be stuck.");
+            throw new Exception("FFmpeg stuck: No output for 5 minutes and no file created");
+          }
+        }
+
         usleep(50000);
       }
 
