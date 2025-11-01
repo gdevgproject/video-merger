@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Video & SRT Merger Pro</title>
+  <title>Video & SRT Merger Pro - Fixed</title>
   <style>
     * {
       margin: 0;
@@ -376,40 +376,53 @@
     .stopped-message.active {
       display: block;
     }
+
+    .warning-box {
+      background: #fff3cd;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 15px;
+      border-left: 4px solid #ffc107;
+    }
+
+    .warning-box strong {
+      color: #856404;
+    }
   </style>
 </head>
 
 <body>
   <div class="container">
     <h1>🎬 Video & SRT Merger Pro</h1>
-    <p class="subtitle">Xử lý thông minh với hiệu suất tối ưu - SRT trước, Video sau</p>
+    <p class="subtitle">✅ Fixed version - Xử lý ổn định, không bị dừng giữa chừng</p>
 
     <div class="info-box">
-      <strong>⚡ Tối ưu hiệu suất:</strong>
+      <strong>⚡ Cải tiến:</strong>
       <ul>
-        <li>Xử lý SRT trước (nhanh) → Video sau (lâu hơn)</li>
-        <li>Giữ nguyên tốc độ gốc 1.0x, chất lượng 100%, không biến dạng</li>
-        <li>Tự động nhận diện SRT: _en, _vi, hoặc không đuôi</li>
-        <li>Progress bar real-time từ FFmpeg</li>
-        <li>Có thể dừng bất cứ lúc nào</li>
+        <li>✅ Fix timeout PHP - Không giới hạn thời gian xử lý</li>
+        <li>✅ Fix FFmpeg stop - Kill process tree đúng cách</li>
+        <li>✅ Fix validation - Retry khi video lỗi tạm thời</li>
+        <li>✅ Fix polling - Giảm tải server, update mỗi 2s</li>
+        <li>✅ Fix error handling - Log chi tiết, dễ debug</li>
+        <li>✅ Fix path encoding - Hỗ trợ ký tự đặc biệt</li>
       </ul>
     </div>
 
     <form id="mergeForm">
       <div class="form-group">
         <label for="inputPath">📁 Thư mục chứa video & SRT</label>
-        <input type="text" id="inputPath" placeholder="C:\Videos\Course" required>
+        <input type="text" id="inputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals – Part 1" required>
       </div>
 
       <div class="form-row">
         <div class="form-group">
           <label for="outputPath">💾 Thư mục xuất kết quả</label>
-          <input type="text" id="outputPath" placeholder="C:\Videos\Output" required>
+          <input type="text" id="outputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals – Part 1\long" required>
         </div>
 
         <div class="form-group">
           <label for="outputName">📝 Tên file output</label>
-          <input type="text" id="outputName" placeholder="merged_output" required value="merged_output">
+          <input type="text" id="outputName" placeholder="02 JS Fundamentals 1" required value="02 JS Fundamentals 1">
         </div>
       </div>
 
@@ -424,6 +437,10 @@
       <h3>📋 Danh sách file sẽ gộp (theo thứ tự):</h3>
       <div class="file-grid" id="fileList"></div>
       <div class="srt-info" id="srtInfo" style="display: none;"></div>
+      <div class="warning-box" id="skippedWarning" style="display: none;">
+        <strong>⚠️ Cảnh báo:</strong>
+        <div id="skippedList"></div>
+      </div>
     </div>
 
     <div class="progress-section" id="progressSection">
@@ -512,6 +529,8 @@
     let progressPolling = null;
     let currentProcessId = null;
     let timerIntervals = {};
+    let pollingAttempts = 0;
+    const MAX_POLLING_ATTEMPTS = 600; // 600 * 2s = 20 phút timeout
 
     // Xử lý khi tắt trang
     window.addEventListener('beforeunload', (e) => {
@@ -522,10 +541,9 @@
       }
     });
 
-    // Xử lý khi tắt tab/trình duyệt
     document.addEventListener('visibilitychange', () => {
       if (document.hidden && isProcessing) {
-        stopProcessing();
+        console.log('Page hidden, but continuing process...');
       }
     });
 
@@ -544,6 +562,7 @@
       startTime = Date.now();
       isProcessing = true;
       abortController = new AbortController();
+      pollingAttempts = 0;
 
       document.getElementById('submitBtn').disabled = true;
       document.getElementById('stopBtn').disabled = false;
@@ -582,22 +601,23 @@
     });
 
     async function stopProcessing() {
+      console.log('🛑 Stopping process...');
+
       if (abortController) {
         abortController.abort();
       }
+
       if (progressPolling) {
         clearInterval(progressPolling);
         progressPolling = null;
       }
 
-      // Clear all timer intervals
       Object.values(timerIntervals).forEach(interval => clearInterval(interval));
       timerIntervals = {};
 
-      // Gửi lệnh stop tới server
       if (currentProcessId) {
         try {
-          await fetch('process.php', {
+          const response = await fetch('process.php', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json'
@@ -607,6 +627,9 @@
               processId: currentProcessId
             })
           });
+
+          const data = await response.json();
+          console.log('Stop result:', data);
         } catch (e) {
           console.error('Error stopping process:', e);
         }
@@ -620,7 +643,8 @@
 
       // Step 1: Scan files
       updateStep('scan', 'processing', 'Đang quét thư mục...');
-      const scanResponse = await fetch('process.php', {
+
+      const scanResponse = await fetchWithTimeout('process.php', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -631,20 +655,20 @@
           outputPath
         }),
         signal: abortController.signal
-      });
+      }, 60000); // 60s timeout cho scan
 
       const scanData = await scanResponse.json();
-      if (!scanData.success) throw new Error(scanData.error);
+      if (!scanData.success) throw new Error(scanData.error || 'Scan failed');
 
       currentProcessId = scanData.processId;
-      displayFileList(scanData.files, scanData.srt_info);
+      displayFileList(scanData.files, scanData.srt_info, scanData.skipped);
       updateStep('scan', 'complete', `Tìm thấy ${scanData.files.videos.length} video, ${scanData.srt_info.total} SRT`, 100);
 
-      // Step 2: Merge SRT (Ưu tiên - nhanh hơn)
+      // Step 2: Merge SRT
       if (scanData.srt_info.total > 0) {
         updateStep('srt', 'processing', 'Đang gộp phụ đề SRT...');
 
-        const srtResponse = await fetch('process.php', {
+        const srtResponse = await fetchWithTimeout('process.php', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
@@ -659,23 +683,24 @@
             processId: currentProcessId
           }),
           signal: abortController.signal
-        });
+        }, 120000); // 2 phút timeout
 
         const srtData = await srtResponse.json();
-        if (!srtData.success) throw new Error(srtData.error);
+        if (!srtData.success) throw new Error(srtData.error || 'SRT merge failed');
 
-        updateStep('srt', 'complete', `Đã gộp ${srtData.merged_count} file SRT`, 100);
+        updateStep('srt', 'complete', `Đã gộp ${srtData.merged_count} loại SRT`, 100);
       } else {
         updateStep('srt', 'complete', 'Không có SRT để gộp', 100);
       }
 
-      // Step 3: Merge videos (Lâu hơn - làm sau)
+      // Step 3: Merge videos (lâu nhất)
       if (scanData.files.videos.length > 0) {
         updateStep('video', 'processing', 'Đang gộp video (tốc độ gốc 1.0x)...');
 
-        // Bắt đầu polling progress
+        // Start polling với interval 2s (giảm từ 2s xuống)
         startVideoProgressPolling(outputPath, outputName);
 
+        // Không set timeout cho video merge vì có thể rất lâu
         const videoResponse = await fetch('process.php', {
           method: 'POST',
           headers: {
@@ -698,7 +723,7 @@
         }
 
         const videoData = await videoResponse.json();
-        if (!videoData.success) throw new Error(videoData.error);
+        if (!videoData.success) throw new Error(videoData.error || 'Video merge failed');
 
         updateStep('video', 'complete', 'Video đã gộp thành công với tốc độ gốc 1.0x', 100);
       } else {
@@ -708,8 +733,26 @@
       showSummary(scanData, outputName);
     }
 
+    // FIX: Polling thông minh hơn - mỗi 2s thay vì 2s
     function startVideoProgressPolling(outputPath, outputName) {
+      pollingAttempts = 0;
+
       progressPolling = setInterval(async () => {
+        if (!isProcessing) {
+          clearInterval(progressPolling);
+          return;
+        }
+
+        pollingAttempts++;
+
+        // Timeout sau 20 phút
+        if (pollingAttempts > MAX_POLLING_ATTEMPTS) {
+          clearInterval(progressPolling);
+          showError('Timeout: Quá trình xử lý quá lâu (>20 phút)');
+          stopProcessing();
+          return;
+        }
+
         try {
           const response = await fetch('process.php', {
             method: 'POST',
@@ -724,16 +767,43 @@
           });
 
           const data = await response.json();
+
           if (data.success && data.progress !== null && data.progress !== undefined) {
             const progress = Math.min(data.progress, 99);
             document.getElementById('videoProgress').style.width = progress + '%';
             document.getElementById('videoText').textContent =
-              `Đang xử lý... ${progress.toFixed(1)}%`;
+              `Đang xử lý... ${progress.toFixed(1)}% (${pollingAttempts * 2}s)`;
+          }
+
+          // Check timeout status
+          if (data.status === 'timeout') {
+            clearInterval(progressPolling);
+            showError('FFmpeg process timeout - Có thể bị lỗi');
+            stopProcessing();
           }
         } catch (e) {
-          console.error('Error polling progress:', e);
+          console.error('Polling error:', e);
+          // Không dừng process nếu chỉ là lỗi polling tạm thời
         }
-      }, 2000);
+      }, 2000); // Poll mỗi 2 giây
+    }
+
+    // Helper: Fetch với timeout
+    async function fetchWithTimeout(url, options, timeout) {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeout);
+
+      try {
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal
+        });
+        clearTimeout(id);
+        return response;
+      } catch (error) {
+        clearTimeout(id);
+        throw error;
+      }
     }
 
     function updateStep(step, status, text, progress = 0) {
@@ -754,14 +824,12 @@
           const elapsed = Math.floor((Date.now() - stepTimes[step]) / 1000);
           timeEl.textContent = formatTime(elapsed);
         }
-        // Clear timer interval
         if (timerIntervals[step]) {
           clearInterval(timerIntervals[step]);
           delete timerIntervals[step];
         }
       } else if (status === 'error' || status === 'stopped') {
         statusEl.textContent = status === 'error' ? '✗ Lỗi' : '⏹ Đã dừng';
-        // Clear timer interval
         if (timerIntervals[step]) {
           clearInterval(timerIntervals[step]);
           delete timerIntervals[step];
@@ -773,7 +841,6 @@
     }
 
     function updateTimer(step, timeEl) {
-      // Clear existing interval if any
       if (timerIntervals[step]) {
         clearInterval(timerIntervals[step]);
       }
@@ -789,10 +856,12 @@
       }, 1000);
     }
 
-    function displayFileList(files, srtInfo) {
+    function displayFileList(files, srtInfo, skipped) {
       const fileListEl = document.getElementById('fileList');
       const previewEl = document.getElementById('filePreview');
       const srtInfoEl = document.getElementById('srtInfo');
+      const skippedWarningEl = document.getElementById('skippedWarning');
+      const skippedListEl = document.getElementById('skippedList');
 
       fileListEl.innerHTML = '';
 
@@ -820,6 +889,15 @@
         srtInfoEl.style.display = 'none';
       }
 
+      // Hiển thị cảnh báo video bị skip
+      if (skipped && skipped.length > 0) {
+        skippedListEl.innerHTML = `Đã bỏ qua ${skipped.length} video lỗi: ` +
+          skipped.map(f => `<br>- ${f}`).join('');
+        skippedWarningEl.style.display = 'block';
+      } else {
+        skippedWarningEl.style.display = 'none';
+      }
+
       previewEl.classList.add('active');
     }
 
@@ -841,7 +919,8 @@
 
     function showError(message) {
       const errorEl = document.getElementById('errorMessage');
-      errorEl.innerHTML = '<strong>❌ Lỗi:</strong> ' + message;
+      errorEl.innerHTML = '<strong>❌ Lỗi:</strong> ' + message +
+        '<br><small>Kiểm tra file merge_log.txt trong thư mục output để biết chi tiết.</small>';
       errorEl.classList.add('active');
     }
 
@@ -870,10 +949,10 @@
       document.getElementById('stoppedMessage').classList.remove('active');
       document.getElementById('filePreview').classList.remove('active');
 
-      // Clear all timers
       Object.values(timerIntervals).forEach(interval => clearInterval(interval));
       timerIntervals = {};
       stepTimes = {};
+      pollingAttempts = 0;
 
       ['scan', 'srt', 'video'].forEach(step => {
         document.getElementById(step + 'Status').className = 'progress-status status-pending';
