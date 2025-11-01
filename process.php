@@ -342,17 +342,18 @@ class VideoMerger
       'description' => 'This is a merged video compilation. Original content rights belong to respective owners.',
       'album' => 'Video Collection ' . date('Y'),
       'date' => date('Y-m-d'),
-      'encoder' => 'FFmpeg with libx264'
+      'encoder' => 'Video Merger Pro with FFmpeg'
     ];
 
-    // Lệnh FFmpeg - GIỮ NGUYÊN TỐC ĐỘ GỐC
+    // Lệnh FFmpeg - DÙNG -c copy để NHANH (không re-encode)
+    // Chỉ thêm metadata mà không encode lại
     $command = sprintf(
       '"%s" -f concat -safe 0 -i "%s" ' .
+        '-c copy ' .
         '-metadata title="%s" -metadata author="%s" -metadata artist="%s" ' .
         '-metadata copyright="%s" -metadata comment="%s" ' .
         '-metadata description="%s" -metadata album="%s" ' .
         '-metadata date="%s" -metadata encoder="%s" ' .
-        '-c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k ' .
         '-movflags +faststart -progress pipe:1 -y "%s" 2>&1',
       FFMPEG_PATH,
       $listFile,
@@ -369,7 +370,7 @@ class VideoMerger
     );
 
     $this->log("Lệnh FFmpeg: $command");
-    $this->log("Đang xử lý video với progress tracking...");
+    $this->log("Đang xử lý video với -c copy (NHANH, không re-encode)...");
 
     $startTime = microtime(true);
 
@@ -417,7 +418,7 @@ class VideoMerger
           }
         }
 
-        usleep(100000);
+        usleep(50000); // Sleep 0.05s (giảm từ 0.1s để responsive hơn)
       }
 
       fclose($pipes[0]);
@@ -451,7 +452,7 @@ class VideoMerger
     }
 
     $fileSize = filesize($outputVideo);
-    $this->log("Video output: $outputVideo (" . $this->formatBytes($fileSize) . ")");
+    $this->log("✓ Video output: $outputVideo (" . $this->formatBytes($fileSize) . ")");
     $this->updateProgress(100, 'completed');
     $this->log("=== KẾT THÚC GỘP VIDEO ===\n");
 
