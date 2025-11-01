@@ -388,7 +388,7 @@
       <strong>⚡ Tối ưu hiệu suất:</strong>
       <ul>
         <li>Xử lý SRT trước (nhanh) → Video sau (lâu hơn)</li>
-        <li>Video tăng tốc x1.1 với chất lượng cao, SRT đồng bộ chính xác</li>
+        <li>Giữ nguyên tốc độ gốc 1.0x, chất lượng 100%, không biến dạng</li>
         <li>Tự động nhận diện SRT: _en, _vi, hoặc không đuôi</li>
         <li>Progress bar real-time từ FFmpeg</li>
         <li>Có thể dừng bất cứ lúc nào</li>
@@ -457,7 +457,7 @@
 
       <div class="progress-item">
         <div class="progress-header">
-          <span class="progress-title">🎥 Gộp và tăng tốc video (x1.1)</span>
+          <span class="progress-title">🎥 Gộp video (Tốc độ gốc 1.0x)</span>
           <span class="progress-status status-pending" id="videoStatus">Chờ xử lý</span>
         </div>
         <div class="progress-bar-container">
@@ -487,7 +487,7 @@
         </div>
         <div class="summary-item">
           <div class="summary-label">⚡ Tốc độ</div>
-          <div class="summary-value">x1.1</div>
+          <div class="summary-value">x1.0</div>
         </div>
         <div class="summary-item" style="grid-column: 1 / -1;">
           <div class="summary-label">📦 Files output</div>
@@ -510,12 +510,14 @@
     let isProcessing = false;
     let abortController = null;
     let progressPolling = null;
+    let currentProcessId = null;
+    let timerIntervals = {};
 
     // Xử lý khi tắt trang
     window.addEventListener('beforeunload', (e) => {
       if (isProcessing) {
         e.preventDefault();
-        e.returnValue = '';
+        e.returnValue = 'Đang xử lý, bạn có chắc muốn thoát?';
         stopProcessing();
       }
     });
@@ -579,13 +581,37 @@
       document.getElementById('resetBtn').disabled = false;
     });
 
-    function stopProcessing() {
+    async function stopProcessing() {
       if (abortController) {
         abortController.abort();
       }
       if (progressPolling) {
         clearInterval(progressPolling);
+        progressPolling = null;
       }
+
+      // Clear all timer intervals
+      Object.values(timerIntervals).forEach(interval => clearInterval(interval));
+      timerIntervals = {};
+
+      // Gửi lệnh stop tới server
+      if (currentProcessId) {
+        try {
+          await fetch('process.php', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              action: 'stop_process',
+              processId: currentProcessId
+            })
+          });
+        } catch (e) {
+          console.error('Error stopping process:', e);
+        }
+      }
+
       isProcessing = false;
     }
 
@@ -610,6 +636,7 @@
       const scanData = await scanResponse.json();
       if (!scanData.success) throw new Error(scanData.error);
 
+      currentProcessId = scanData.processId;
       displayFileList(scanData.files, scanData.srt_info);
       updateStep('scan', 'complete', `Tìm thấy ${scanData.files.videos.length} video, ${scanData.srt_info.total} SRT`, 100);
 
@@ -628,7 +655,8 @@
             outputPath,
             outputName,
             srt_files: scanData.files.srt_all,
-            videos: scanData.files.videos
+            videos: scanData.files.videos,
+            processId: currentProcessId
           }),
           signal: abortController.signal
         });
@@ -637,11 +665,13 @@
         if (!srtData.success) throw new Error(srtData.error);
 
         updateStep('srt', 'complete', `Đã gộp ${srtData.merged_count} file SRT`, 100);
+      } else {
+        updateStep('srt', 'complete', 'Không có SRT để gộp', 100);
       }
 
       // Step 3: Merge videos (Lâu hơn - làm sau)
       if (scanData.files.videos.length > 0) {
-        updateStep('video', 'processing', 'Đang gộp và tăng tốc video...');
+        updateStep('video', 'processing', 'Đang gộp video (tốc độ gốc 1.0x)...');
 
         // Bắt đầu polling progress
         startVideoProgressPolling(outputPath, outputName);
@@ -656,17 +686,23 @@
             inputPath,
             outputPath,
             outputName,
-            videos: scanData.files.videos
+            videos: scanData.files.videos,
+            processId: currentProcessId
           }),
           signal: abortController.signal
         });
 
-        clearInterval(progressPolling);
+        if (progressPolling) {
+          clearInterval(progressPolling);
+          progressPolling = null;
+        }
 
         const videoData = await videoResponse.json();
         if (!videoData.success) throw new Error(videoData.error);
 
-        updateStep('video', 'complete', 'Video đã gộp thành công với tốc độ x1.1', 100);
+        updateStep('video', 'complete', 'Video đã gộp thành công với tốc độ gốc 1.0x', 100);
+      } else {
+        updateStep('video', 'complete', 'Không có video để gộp', 100);
       }
 
       showSummary(scanData, outputName);
@@ -688,14 +724,14 @@
           });
 
           const data = await response.json();
-          if (data.success && data.progress) {
+          if (data.success && data.progress !== null && data.progress !== undefined) {
             const progress = Math.min(data.progress, 99);
             document.getElementById('videoProgress').style.width = progress + '%';
             document.getElementById('videoText').textContent =
               `Đang xử lý... ${progress.toFixed(1)}%`;
           }
         } catch (e) {
-          // Ignore errors during polling
+          console.error('Error polling progress:', e);
         }
       }, 2000);
     }
@@ -714,10 +750,22 @@
         updateTimer(step, timeEl);
       } else if (status === 'complete') {
         statusEl.textContent = '✓ Hoàn thành';
-        const elapsed = Math.floor((Date.now() - stepTimes[step]) / 1000);
-        timeEl.textContent = formatTime(elapsed);
+        if (stepTimes[step]) {
+          const elapsed = Math.floor((Date.now() - stepTimes[step]) / 1000);
+          timeEl.textContent = formatTime(elapsed);
+        }
+        // Clear timer interval
+        if (timerIntervals[step]) {
+          clearInterval(timerIntervals[step]);
+          delete timerIntervals[step];
+        }
       } else if (status === 'error' || status === 'stopped') {
         statusEl.textContent = status === 'error' ? '✗ Lỗi' : '⏹ Đã dừng';
+        // Clear timer interval
+        if (timerIntervals[step]) {
+          clearInterval(timerIntervals[step]);
+          delete timerIntervals[step];
+        }
       }
 
       textEl.textContent = text;
@@ -725,9 +773,15 @@
     }
 
     function updateTimer(step, timeEl) {
-      const interval = setInterval(() => {
+      // Clear existing interval if any
+      if (timerIntervals[step]) {
+        clearInterval(timerIntervals[step]);
+      }
+
+      timerIntervals[step] = setInterval(() => {
         if (!stepTimes[step] || !isProcessing) {
-          clearInterval(interval);
+          clearInterval(timerIntervals[step]);
+          delete timerIntervals[step];
           return;
         }
         const elapsed = Math.floor((Date.now() - stepTimes[step]) / 1000);
@@ -746,22 +800,25 @@
         const div = document.createElement('div');
         div.className = 'file-item';
         div.innerHTML = `
-                    <span class="file-number">#${index + 1}</span>
-                    <span class="file-name" title="${file}">🎬 ${file}</span>
-                `;
+          <span class="file-number">#${index + 1}</span>
+          <span class="file-name" title="${file}">🎬 ${file}</span>
+        `;
         fileListEl.appendChild(div);
       });
 
-      // Hiển thị thông tin SRT
       let srtInfoText = '<strong>📝 Phụ đề tìm thấy:</strong> ';
       const details = [];
       if (srtInfo.en > 0) details.push(`${srtInfo.en} file EN`);
       if (srtInfo.vi > 0) details.push(`${srtInfo.vi} file VI`);
       if (srtInfo.unknown > 0) details.push(`${srtInfo.unknown} file không đuôi`);
 
-      srtInfoText += details.join(', ');
-      srtInfoEl.innerHTML = srtInfoText;
-      srtInfoEl.style.display = 'block';
+      if (details.length > 0) {
+        srtInfoText += details.join(', ');
+        srtInfoEl.innerHTML = srtInfoText;
+        srtInfoEl.style.display = 'block';
+      } else {
+        srtInfoEl.style.display = 'none';
+      }
 
       previewEl.classList.add('active');
     }
@@ -812,6 +869,10 @@
       document.getElementById('errorMessage').classList.remove('active');
       document.getElementById('stoppedMessage').classList.remove('active');
       document.getElementById('filePreview').classList.remove('active');
+
+      // Clear all timers
+      Object.values(timerIntervals).forEach(interval => clearInterval(interval));
+      timerIntervals = {};
       stepTimes = {};
 
       ['scan', 'srt', 'video'].forEach(step => {
