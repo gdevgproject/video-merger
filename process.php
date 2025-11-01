@@ -6,16 +6,14 @@ ini_set('display_errors', 0);
 // ===== ULTRA PERFORMANCE CONFIGURATION =====
 set_time_limit(0);
 ini_set('max_execution_time', '0');
-ini_set('memory_limit', '8G'); // 8GB for massive files
+ini_set('memory_limit', '8G');
 ignore_user_abort(true);
-
-// Increase buffer for better I/O performance
 ini_set('output_buffering', '4096');
 
 define('FFMPEG_PATH', 'C:\\ooxmind\\bin\\ffmpeg\\bin\\ffmpeg.exe');
 define('FFPROBE_PATH', 'C:\\ooxmind\\bin\\ffmpeg\\bin\\ffprobe.exe');
 define('MAX_RETRIES', 3);
-define('PROGRESS_UPDATE_INTERVAL', 0.5); // Update every 0.5 seconds
+define('PROGRESS_UPDATE_INTERVAL', 0.3);
 
 class VideoMergerUltra
 {
@@ -28,7 +26,8 @@ class VideoMergerUltra
   private $currentProcessPid = null;
   private $lastProgressUpdate = 0;
   private $logBuffer = [];
-  private $logBufferSize = 50; // Batch log writes
+  private $logBufferSize = 50;
+  private $outputVideoPath = '';
 
   public function __construct($inputPath, $outputPath)
   {
@@ -45,7 +44,6 @@ class VideoMergerUltra
     $timestamp = date('Y-m-d H:i:s');
     $this->logBuffer[] = "[$timestamp] $message";
 
-    // Batch write logs to reduce I/O
     if (count($this->logBuffer) >= $this->logBufferSize || $forceWrite) {
       $this->flushLogs();
     }
@@ -64,27 +62,40 @@ class VideoMergerUltra
     $this->flushLogs();
   }
 
-  // ===== OPTIMIZED PROGRESS UPDATE =====
+  // ===== FORCE IMMEDIATE PROGRESS UPDATE =====
   private function updateProgress($progress, $status = '', $currentTime = 0, $totalDuration = 0)
   {
     $now = microtime(true);
 
-    // Throttle updates to reduce I/O load
+    // More frequent updates for better UX
     if ($now - $this->lastProgressUpdate < PROGRESS_UPDATE_INTERVAL && $progress < 100) {
       return;
     }
 
     $this->lastProgressUpdate = $now;
 
+    // Get output file size
+    $fileSize = 0;
+    if (!empty($this->outputVideoPath) && file_exists($this->outputVideoPath)) {
+      $fileSize = filesize($this->outputVideoPath);
+    }
+
     $data = [
       'progress' => round($progress, 2),
       'status' => $status,
       'timestamp' => time(),
-      'current_time' => $currentTime,
-      'total_duration' => $totalDuration
+      'current_time' => round($currentTime, 2),
+      'total_duration' => round($totalDuration, 2),
+      'file_size' => $fileSize
     ];
 
+    // Force write immediately with exclusive lock
     @file_put_contents($this->progressFile, json_encode($data), LOCK_EX);
+
+    // Force disk flush (Windows)
+    if (function_exists('exec')) {
+      @exec('echo. >> "' . $this->progressFile . '"', $out, $ret);
+    }
   }
 
   private function saveProcessPid($pid)
@@ -93,29 +104,6 @@ class VideoMergerUltra
     $this->currentProcessPid = $pid;
   }
 
-  // ===== CHECKPOINT SYSTEM FOR RECOVERY =====
-  private function saveCheckpoint($step, $data)
-  {
-    $checkpoint = [
-      'step' => $step,
-      'data' => $data,
-      'timestamp' => time()
-    ];
-    @file_put_contents($this->checkpointFile, json_encode($checkpoint), LOCK_EX);
-  }
-
-  private function loadCheckpoint()
-  {
-    if (file_exists($this->checkpointFile)) {
-      $content = @file_get_contents($this->checkpointFile);
-      if ($content) {
-        return json_decode($content, true);
-      }
-    }
-    return null;
-  }
-
-  // ===== ENHANCED STOP PROCESS WITH TREE KILL =====
   public function stopCurrentProcess()
   {
     $this->log("🛑 Initiating process termination...", true);
@@ -125,14 +113,11 @@ class VideoMergerUltra
       if ($pid && is_numeric($pid)) {
         $this->log("Killing PID: $pid and all children");
 
-        // Kill entire process tree
         exec("taskkill /F /T /PID $pid 2>&1", $output, $returnCode);
         $this->log("Taskkill result (code $returnCode): " . implode("; ", $output));
 
-        // Wait for graceful termination
         sleep(2);
 
-        // Verify process is dead
         exec("tasklist /FI \"PID eq $pid\" 2>&1", $checkOutput);
         if (!preg_match("/\b$pid\b/", implode("\n", $checkOutput))) {
           $this->log("✓ Process terminated successfully");
@@ -147,49 +132,60 @@ class VideoMergerUltra
     $this->flushLogs();
   }
 
-  public function getProgress()
+  public function getProgress($outputPath = '', $outputName = '')
   {
     if (file_exists($this->progressFile)) {
       $content = @file_get_contents($this->progressFile);
       if ($content) {
         $data = json_decode($content, true);
 
-        // Timeout detection
+        // Check timeout
         if (isset($data['timestamp']) && (time() - $data['timestamp']) > 60) {
-          return ['progress' => 0, 'status' => 'timeout', 'message' => 'Progress stalled for 60s'];
+          return [
+            'progress' => $data['progress'] ?? 0,
+            'status' => 'timeout',
+            'message' => 'Progress stalled for 60s',
+            'file_size' => $data['file_size'] ?? 0
+          ];
+        }
+
+        // Add file size if available
+        if (!empty($outputPath) && !empty($outputName)) {
+          $videoPath = $outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
+          if (file_exists($videoPath)) {
+            $data['file_size'] = filesize($videoPath);
+          }
         }
 
         return $data;
       }
     }
-    return ['progress' => 0, 'status' => 'not_started'];
+    return ['progress' => 0, 'status' => 'not_started', 'file_size' => 0];
   }
 
-  // ===== DISK SPACE VALIDATION =====
   private function checkDiskSpace($estimatedSize)
   {
-    $drive = substr($this->outputPath, 0, 2); // e.g., "D:"
+    $drive = substr($this->outputPath, 0, 2);
     $freeSpace = @disk_free_space($drive);
 
     if ($freeSpace === false) {
       $this->log("⚠️ Cannot check disk space");
-      return true; // Continue anyway
+      return true;
     }
 
-    $required = $estimatedSize * 1.2; // Add 20% buffer
+    $required = $estimatedSize * 1.2;
     $freeGB = $freeSpace / (1024 * 1024 * 1024);
     $requiredGB = $required / (1024 * 1024 * 1024);
 
-    $this->log("💾 Disk space: {$freeGB}GB free, need ~{$requiredGB}GB");
+    $this->log("💾 Disk space: " . round($freeGB, 2) . "GB free, need ~" . round($requiredGB, 2) . "GB");
 
     if ($freeSpace < $required) {
-      throw new Exception("Không đủ dung lượng đĩa! Cần {$requiredGB}GB, chỉ còn {$freeGB}GB");
+      throw new Exception("Không đủ dung lượng đĩa! Cần " . round($requiredGB, 2) . "GB, chỉ còn " . round($freeGB, 2) . "GB");
     }
 
     return true;
   }
 
-  // ===== ADVANCED VIDEO VALIDATION WITH RETRY =====
   private function isValidVideo($videoPath, $retries = MAX_RETRIES)
   {
     if (!file_exists($videoPath)) {
@@ -202,12 +198,10 @@ class VideoMergerUltra
       return false;
     }
 
-    // Retry validation
     for ($i = 0; $i <= $retries; $i++) {
       $duration = $this->getVideoDuration($videoPath);
 
       if ($duration > 0) {
-        // Additional validation: check codec
         $info = $this->getVideoInfo($videoPath);
         if ($info && isset($info['codec_name'])) {
           return true;
@@ -216,7 +210,7 @@ class VideoMergerUltra
 
       if ($i < $retries) {
         $this->log("  ⏳ Retry validation... (" . ($i + 1) . "/$retries)");
-        usleep(500000); // 0.5s
+        usleep(500000);
       }
     }
 
@@ -224,7 +218,6 @@ class VideoMergerUltra
     return false;
   }
 
-  // ===== GET DETAILED VIDEO INFO =====
   private function getVideoInfo($videoPath)
   {
     $command = sprintf(
@@ -251,7 +244,6 @@ class VideoMergerUltra
     return null;
   }
 
-  // ===== ULTRA-OPTIMIZED SCAN WITH STATS =====
   public function scanFiles()
   {
     $this->log("=== 🚀 ULTRA SCAN STARTED ===", true);
@@ -306,7 +298,7 @@ class VideoMergerUltra
             $totalSize += $fileSize;
             $totalDuration += $duration;
 
-            $this->log("  ✓ Valid: [$order] {$file} - {$duration}s");
+            $this->log("  ✓ Valid: [$order] $file - " . round($duration, 2) . "s");
           } else {
             $skippedVideos[] = $file;
             $this->log("  ✗ SKIPPED: $file");
@@ -346,12 +338,11 @@ class VideoMergerUltra
       throw new Exception("No valid videos found!");
     }
 
-    // Check disk space
     $this->checkDiskSpace($totalSize);
 
     $scanTime = round(microtime(true) - $scanStart, 2);
     $this->log("✅ Scan complete in {$scanTime}s: " . count($videos) . " videos, " .
-      $this->formatBytes($totalSize) . ", {$totalDuration}s");
+      $this->formatBytes($totalSize) . ", " . round($totalDuration, 2) . "s");
     $this->log("=== SCAN FINISHED ===\n", true);
 
     $srt_all = [];
@@ -378,10 +369,11 @@ class VideoMergerUltra
       ],
       'skipped' => $skippedVideos,
       'total_duration' => $totalDuration,
+      'estimated_size' => $totalSize * 1.05,
       'stats' => [
         'total_size' => $this->formatBytes($totalSize),
-        'total_duration' => $this->formatTime($totalDuration),
-        'estimated_output' => $this->formatBytes($totalSize * 1.05) // ~5% overhead
+        'total_duration' => $this->formatTime(round($totalDuration)),
+        'estimated_output' => $this->formatBytes($totalSize * 1.05)
       ]
     ];
   }
@@ -411,7 +403,7 @@ class VideoMergerUltra
     return $merged_count;
   }
 
-  // ===== ULTRA-OPTIMIZED VIDEO MERGE =====
+  // ===== ENHANCED VIDEO MERGE WITH BETTER PROGRESS PARSING =====
   public function mergeVideos($videoFiles, $outputName = 'merged_output', $totalDuration = 0)
   {
     $this->log("=== 🎥 ULTRA FAST VIDEO MERGE STARTED ===", true);
@@ -451,7 +443,6 @@ class VideoMergerUltra
     $totalDuration = $totalDuration > 0 ? $totalDuration : $calculatedDuration;
     $this->log("📊 Total duration: " . round($totalDuration, 2) . "s (" . count($validVideos) . " videos)");
 
-    // Create filelist with proper escaping
     $listFile = $this->outputPath . DIRECTORY_SEPARATOR . 'filelist.txt';
     $listContent = '';
 
@@ -467,13 +458,16 @@ class VideoMergerUltra
     }
 
     $outputVideo = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
+    $this->outputVideoPath = $outputVideo;
 
     if (file_exists($outputVideo)) {
       @unlink($outputVideo);
       $this->log("🗑️ Removed old output file");
     }
 
-    // Enhanced metadata
+    // Create empty file immediately so user sees it's being created
+    @touch($outputVideo);
+
     $metadata = [
       'title' => $outputName,
       'author' => 'Video Merger Pro Ultra',
@@ -486,19 +480,18 @@ class VideoMergerUltra
       'encoder' => 'Video Merger Pro Ultra with FFmpeg'
     ];
 
-    // ===== ULTRA-OPTIMIZED FFMPEG COMMAND =====
     $command = sprintf(
       '"%s" -f concat -safe 0 -i "%s" ' .
         '-c copy ' .
-        '-fflags +genpts ' .                          // Generate PTS for better sync
-        '-avoid_negative_ts make_zero ' .            // Fix timestamp issues
-        '-max_muxing_queue_size 9999 ' .             // Large queue for smooth muxing
-        '-analyzeduration 100M -probesize 100M ' .   // Large buffers for better analysis
+        '-fflags +genpts ' .
+        '-avoid_negative_ts make_zero ' .
+        '-max_muxing_queue_size 9999 ' .
+        '-analyzeduration 100M -probesize 100M ' .
         '-metadata title="%s" -metadata author="%s" -metadata artist="%s" ' .
         '-metadata copyright="%s" -metadata comment="%s" ' .
         '-metadata description="%s" -metadata album="%s" ' .
         '-metadata date="%s" -metadata encoder="%s" ' .
-        '-movflags +faststart ' .                    // Enable fast start for web streaming
+        '-movflags +faststart ' .
         '-progress pipe:1 -y "%s" 2>&1',
       FFMPEG_PATH,
       $listFile,
@@ -542,8 +535,9 @@ class VideoMergerUltra
     $errorOutput = '';
     $lastHeartbeat = time();
     $progressStartTime = microtime(true);
+    $lastLogTime = 0;
 
-    // ===== REAL-TIME PROGRESS TRACKING =====
+    // ===== ENHANCED PROGRESS PARSING WITH MULTIPLE PATTERNS =====
     while (true) {
       $status = proc_get_status($process);
 
@@ -566,24 +560,44 @@ class VideoMergerUltra
       }
 
       if ($output !== false && $output !== '') {
-        // Parse FFmpeg progress - use out_time_us for microsecond precision
+        $currentTime = 0;
+
+        // Try multiple patterns for better compatibility
+        // Pattern 1: out_time_us (microseconds) - most accurate
         if (preg_match('/out_time_us=(\d+)/', $output, $matches)) {
-          $currentTimeUs = intval($matches[1]);
-          $currentTime = $currentTimeUs / 1000000; // Convert to seconds
+          $currentTime = intval($matches[1]) / 1000000;
+        }
+        // Pattern 2: out_time_ms (milliseconds) - fallback
+        elseif (preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
+          $currentTime = intval($matches[1]) / 1000;
+        }
+        // Pattern 3: out_time (formatted) - last resort
+        elseif (preg_match('/out_time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
+          $currentTime = intval($matches[1]) * 3600 + intval($matches[2]) * 60 + floatval($matches[3]);
+        }
+        // Pattern 4: time= (from stderr sometimes)
+        elseif (preg_match('/time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
+          $currentTime = intval($matches[1]) * 3600 + intval($matches[2]) * 60 + floatval($matches[3]);
+        }
 
-          if ($totalDuration > 0) {
-            $progress = min(($currentTime / $totalDuration) * 100, 99.9);
+        if ($currentTime > 0 && $totalDuration > 0) {
+          $progress = min(($currentTime / $totalDuration) * 100, 99.9);
 
-            if ($progress > $lastProgress + 0.3) { // Update every 0.3%
-              $this->updateProgress($progress, 'encoding', $currentTime, $totalDuration);
-              $lastProgress = $progress;
+          if ($progress > $lastProgress + 0.2) {
+            $this->updateProgress($progress, 'encoding', $currentTime, $totalDuration);
+            $lastProgress = $progress;
+
+            // Log progress occasionally
+            if (time() - $lastLogTime >= 10) {
+              $this->log("Progress: " . round($progress, 1) . "% (" . round($currentTime, 1) . "s / " . round($totalDuration, 1) . "s)");
+              $lastLogTime = time();
             }
           }
         }
       }
 
       if ($output === false && $error === false) {
-        usleep(50000); // 0.05s sleep to reduce CPU usage
+        usleep(50000);
       }
 
       // Timeout protection - 4 hours max
@@ -649,7 +663,6 @@ class VideoMergerUltra
     ];
   }
 
-  // ===== OPTIMIZED DURATION DETECTION =====
   private function getVideoDuration($videoPath)
   {
     static $durationCache = [];
@@ -658,7 +671,6 @@ class VideoMergerUltra
       return $durationCache[$videoPath];
     }
 
-    // Try ffprobe first (faster and more accurate)
     $command = sprintf(
       '"%s" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%s" 2>&1',
       FFPROBE_PATH,
@@ -675,7 +687,6 @@ class VideoMergerUltra
       }
     }
 
-    // Fallback to ffmpeg
     $command = sprintf('"%s" -i "%s" 2>&1', FFMPEG_PATH, $videoPath);
     exec($command, $output);
 
@@ -719,7 +730,6 @@ class VideoMergerUltra
         continue;
       }
 
-      // Remove BOM
       $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
 
       $subtitles = $this->parseSRT($content);
@@ -814,8 +824,10 @@ class VideoMergerUltra
     return round($bytes, 2) . ' ' . $units[$i];
   }
 
+  // ===== FIX: Format time correctly (no decimal places) =====
   private function formatTime($seconds)
   {
+    $seconds = round($seconds); // Remove decimals
     $h = floor($seconds / 3600);
     $m = floor(($seconds % 3600) / 60);
     $s = $seconds % 60;
@@ -823,7 +835,7 @@ class VideoMergerUltra
   }
 }
 
-// ===== REQUEST HANDLER WITH ROBUST ERROR HANDLING =====
+// ===== REQUEST HANDLER =====
 try {
   $input = json_decode(file_get_contents('php://input'), true);
 
@@ -851,6 +863,7 @@ try {
         'srt_info' => $result['srt_info'],
         'skipped' => $result['skipped'] ?? [],
         'total_duration' => $result['total_duration'],
+        'estimated_size' => $result['estimated_size'],
         'stats' => $result['stats'],
         'processId' => uniqid('ultra_', true)
       ]);
@@ -888,7 +901,9 @@ try {
       break;
 
     case 'get_progress':
-      $progress = $merger->getProgress();
+      $outputPath = $input['outputPath'] ?? '';
+      $outputName = $input['outputName'] ?? '';
+      $progress = $merger->getProgress($outputPath, $outputName);
       echo json_encode(array_merge(['success' => true], $progress));
       break;
 

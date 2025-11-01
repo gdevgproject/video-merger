@@ -405,6 +405,12 @@
     .stats-box strong {
       color: #667eea;
     }
+
+    .debug-info {
+      font-size: 11px;
+      color: #999;
+      margin-top: 3px;
+    }
   </style>
 </head>
 
@@ -417,12 +423,11 @@
       <strong>🔥 Ultra Performance Features:</strong>
       <ul>
         <li>✅ Real-time accurate progress tracking with ETA</li>
+        <li>✅ File size monitoring for live feedback</li>
         <li>✅ Optimized for large files (50+ videos, 10+ hours output)</li>
         <li>✅ Maximum CPU/RAM utilization (i7 Gen 10, 12GB RAM)</li>
         <li>✅ Advanced FFmpeg flags for speed & reliability</li>
         <li>✅ Smart retry system with checkpoint recovery</li>
-        <li>✅ Zero-lag progress updates (independent timers)</li>
-        <li>✅ Disk space validation before processing</li>
         <li>✅ 100% success rate guarantee</li>
       </ul>
     </div>
@@ -504,6 +509,7 @@
           <span id="videoText">Đang chờ...</span>
           <span><span id="videoTime"></span> <span id="videoEta" class="progress-eta"></span></span>
         </div>
+        <div class="debug-info" id="videoDebug"></div>
       </div>
     </div>
 
@@ -552,6 +558,9 @@
     let totalVideoDuration = 0;
     let videoStartTime = 0;
     let lastProgressPercent = 0;
+    let outputVideoPath = '';
+    let consecutiveZeroProgress = 0;
+    let estimatedOutputSize = 0;
 
     window.addEventListener('beforeunload', (e) => {
       if (isProcessing) {
@@ -576,6 +585,7 @@
       startTime = Date.now();
       isProcessing = true;
       abortController = new AbortController();
+      consecutiveZeroProgress = 0;
 
       document.getElementById('submitBtn').disabled = true;
       document.getElementById('stopBtn').disabled = false;
@@ -676,9 +686,11 @@
 
       currentProcessId = scanData.processId;
       totalVideoDuration = scanData.total_duration || 0;
+      estimatedOutputSize = scanData.estimated_size || 0;
+      outputVideoPath = outputPath + '\\' + outputName + '.mp4';
 
       displayFileList(scanData.files, scanData.srt_info, scanData.skipped, scanData.stats);
-      updateStep('scan', 'complete', `✓ ${scanData.files.videos.length} videos, ${scanData.srt_info.total} SRT (${formatTime(totalVideoDuration)})`, 100);
+      updateStep('scan', 'complete', `✓ ${scanData.files.videos.length} videos, ${scanData.srt_info.total} SRT (${formatTime(Math.round(totalVideoDuration))})`, 100);
 
       // Step 2: Merge SRT
       if (scanData.srt_info.total > 0) {
@@ -711,11 +723,11 @@
 
       // Step 3: Merge videos
       if (scanData.files.videos.length > 0) {
-        updateStep('video', 'processing', 'Đang gộp video (Ultra Fast Mode)...');
+        updateStep('video', 'processing', 'Đang khởi động FFmpeg...');
         videoStartTime = Date.now();
 
-        // Start real-time progress polling
-        startVideoProgressPolling();
+        // Start enhanced progress polling
+        startEnhancedProgressPolling(outputPath, outputName);
 
         const videoResponse = await fetch('process.php', {
           method: 'POST',
@@ -750,9 +762,11 @@
       showSummary(scanData, outputName);
     }
 
-    function startVideoProgressPolling() {
+    function startEnhancedProgressPolling(outputPath, outputName) {
       let consecutiveErrors = 0;
       const MAX_ERRORS = 5;
+      let lastFileSize = 0;
+      let fileSizeStuckCount = 0;
 
       progressPolling = setInterval(async () => {
         if (!isProcessing) {
@@ -767,24 +781,61 @@
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-              action: 'get_progress'
+              action: 'get_progress',
+              outputPath: outputPath,
+              outputName: outputName
             })
           });
 
           const data = await response.json();
           consecutiveErrors = 0;
 
-          if (data.success && data.progress !== null) {
-            const progress = Math.min(data.progress, 99.9);
+          if (data.success) {
+            let progress = data.progress || 0;
+            const fileSize = data.file_size || 0;
+            const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+
+            // Update debug info
+            const debugEl = document.getElementById('videoDebug');
+            debugEl.textContent = `Debug: progress=${progress.toFixed(1)}%, fileSize=${fileSizeMB}MB, status=${data.status || 'unknown'}`;
+
+            // Check if file size is growing (alternative progress indicator)
+            if (fileSize > lastFileSize) {
+              fileSizeStuckCount = 0;
+              lastFileSize = fileSize;
+
+              // If FFmpeg progress is stuck but file is growing, estimate progress from file size
+              if (progress < 1 && estimatedOutputSize > 0) {
+                progress = Math.min((fileSize / estimatedOutputSize) * 100, 99);
+                console.log(`Using file size based progress: ${progress.toFixed(1)}%`);
+              }
+            } else if (fileSize > 0) {
+              fileSizeStuckCount++;
+            }
+
+            // Detect stuck: file size not growing for 30 seconds
+            if (fileSizeStuckCount > 30 && progress < 99) {
+              clearInterval(progressPolling);
+              showError('Process stuck: File size not growing. FFmpeg may have frozen.');
+              stopProcessing();
+              return;
+            }
+
+            progress = Math.min(progress, 99.9);
             const progressBar = document.getElementById('videoProgress');
             const progressText = document.getElementById('videoText');
             const etaEl = document.getElementById('videoEta');
 
             progressBar.style.width = progress + '%';
-            progressText.textContent = `Đang xử lý... ${progress.toFixed(1)}%`;
+
+            if (fileSize > 0) {
+              progressText.textContent = `Đang xử lý... ${progress.toFixed(1)}% (${fileSizeMB} MB)`;
+            } else {
+              progressText.textContent = `Đang xử lý... ${progress.toFixed(1)}%`;
+            }
 
             // Calculate ETA
-            if (progress > 0 && totalVideoDuration > 0) {
+            if (progress > 1 && totalVideoDuration > 0) {
               const elapsed = (Date.now() - videoStartTime) / 1000;
               const estimatedTotal = (elapsed / progress) * 100;
               const remaining = estimatedTotal - elapsed;
@@ -792,6 +843,18 @@
               if (remaining > 0 && progress > 1) {
                 etaEl.textContent = `(ETA: ${formatTime(Math.round(remaining))})`;
               }
+            }
+
+            // Track zero progress
+            if (progress < 0.1) {
+              consecutiveZeroProgress++;
+              if (consecutiveZeroProgress > 60) { // 60 seconds stuck at 0%
+                clearInterval(progressPolling);
+                showError('Progress stuck at 0% for 60 seconds. Check merge_log.txt for details.');
+                stopProcessing();
+              }
+            } else {
+              consecutiveZeroProgress = 0;
             }
 
             lastProgressPercent = progress;
@@ -808,10 +871,10 @@
 
           if (consecutiveErrors >= MAX_ERRORS) {
             clearInterval(progressPolling);
-            showError('Lost connection to server. Process may still be running.');
+            showError('Lost connection to server. Process may still be running. Check output folder.');
           }
         }
-      }, 1000); // Poll every 1 second for smooth updates
+      }, 1000); // Poll every 1 second
     }
 
     function updateStep(step, status, text, progress = 0) {
@@ -976,6 +1039,8 @@
       totalVideoDuration = 0;
       videoStartTime = 0;
       lastProgressPercent = 0;
+      consecutiveZeroProgress = 0;
+      estimatedOutputSize = 0;
 
       ['scan', 'srt', 'video'].forEach(step => {
         document.getElementById(step + 'Status').className = 'progress-status status-pending';
@@ -986,6 +1051,7 @@
       });
 
       document.getElementById('videoEta').textContent = '';
+      document.getElementById('videoDebug').textContent = '';
     }
   </script>
 </body>
