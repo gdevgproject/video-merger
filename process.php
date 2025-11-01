@@ -62,7 +62,27 @@ class VideoMergerUltra
     $this->flushLogs();
   }
 
-  // ===== FORCE IMMEDIATE PROGRESS UPDATE =====
+  // ===== FIX: VALIDATE FFMPEG BEFORE USE =====
+  private function validateFFmpeg()
+  {
+    if (!file_exists(FFMPEG_PATH)) {
+      throw new Exception("FFmpeg not found at: " . FFMPEG_PATH);
+    }
+    if (!file_exists(FFPROBE_PATH)) {
+      throw new Exception("FFprobe not found at: " . FFPROBE_PATH);
+    }
+
+    // Test FFmpeg execution
+    exec('"' . FFMPEG_PATH . '" -version 2>&1', $output, $returnCode);
+    if ($returnCode !== 0) {
+      throw new Exception("FFmpeg execution failed. Check permissions and path.");
+    }
+
+    $this->log("✅ FFmpeg validated: " . (isset($output[0]) ? $output[0] : 'OK'));
+    return true;
+  }
+
+  // ===== FIX: FORCE IMMEDIATE PROGRESS UPDATE =====
   private function updateProgress($progress, $status = '', $currentTime = 0, $totalDuration = 0)
   {
     $now = microtime(true);
@@ -90,7 +110,11 @@ class VideoMergerUltra
     ];
 
     // Force write immediately with exclusive lock
-    @file_put_contents($this->progressFile, json_encode($data), LOCK_EX);
+    $written = @file_put_contents($this->progressFile, json_encode($data), LOCK_EX);
+
+    if ($written === false) {
+      $this->log("⚠️ Failed to write progress file", true);
+    }
 
     // Force disk flush (Windows)
     if (function_exists('exec')) {
@@ -120,7 +144,7 @@ class VideoMergerUltra
 
         exec("tasklist /FI \"PID eq $pid\" 2>&1", $checkOutput);
         if (!preg_match("/\b$pid\b/", implode("\n", $checkOutput))) {
-          $this->log("✓ Process terminated successfully");
+          $this->log("✅ Process terminated successfully");
         } else {
           $this->log("⚠️ Process may still be running");
         }
@@ -139,12 +163,12 @@ class VideoMergerUltra
       if ($content) {
         $data = json_decode($content, true);
 
-        // Check timeout
-        if (isset($data['timestamp']) && (time() - $data['timestamp']) > 60) {
+        // Check timeout - increased to 120s for large files
+        if (isset($data['timestamp']) && (time() - $data['timestamp']) > 120) {
           return [
             'progress' => $data['progress'] ?? 0,
             'status' => 'timeout',
-            'message' => 'Progress stalled for 60s',
+            'message' => 'Progress stalled for 120s',
             'file_size' => $data['file_size'] ?? 0
           ];
         }
@@ -298,7 +322,7 @@ class VideoMergerUltra
             $totalSize += $fileSize;
             $totalDuration += $duration;
 
-            $this->log("  ✓ Valid: [$order] $file - " . round($duration, 2) . "s");
+            $this->log("  ✅ Valid: [$order] $file - " . round($duration, 2) . "s");
           } else {
             $skippedVideos[] = $file;
             $this->log("  ✗ SKIPPED: $file");
@@ -403,11 +427,14 @@ class VideoMergerUltra
     return $merged_count;
   }
 
-  // ===== ENHANCED VIDEO MERGE WITH BETTER PROGRESS PARSING =====
+  // ===== FIX: ENHANCED VIDEO MERGE WITH BETTER ERROR HANDLING =====
   public function mergeVideos($videoFiles, $outputName = 'merged_output', $totalDuration = 0)
   {
     $this->log("=== 🎥 ULTRA FAST VIDEO MERGE STARTED ===", true);
     $mergeStart = microtime(true);
+
+    // FIX: Validate FFmpeg first
+    $this->validateFFmpeg();
 
     if (empty($videoFiles)) {
       throw new Exception("No videos to merge");
@@ -433,7 +460,7 @@ class VideoMergerUltra
 
       $validVideos[] = $video;
       $calculatedDuration += $duration;
-      $this->log("✓ $video - " . round($duration, 2) . "s");
+      $this->log("✅ $video - " . round($duration, 2) . "s");
     }
 
     if (empty($validVideos)) {
@@ -457,6 +484,8 @@ class VideoMergerUltra
       throw new Exception("Cannot create filelist: $listFile");
     }
 
+    $this->log("📄 Filelist created: $listFile");
+
     $outputVideo = $this->outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
     $this->outputVideoPath = $outputVideo;
 
@@ -465,8 +494,9 @@ class VideoMergerUltra
       $this->log("🗑️ Removed old output file");
     }
 
-    // Create empty file immediately so user sees it's being created
-    @touch($outputVideo);
+    // FIX: Initialize progress BEFORE starting FFmpeg
+    $this->updateProgress(0.1, 'starting', 0, $totalDuration);
+    $this->log("📊 Progress file initialized");
 
     $metadata = [
       'title' => $outputName,
@@ -507,8 +537,9 @@ class VideoMergerUltra
       $outputVideo
     );
 
-    $this->log("🚀 FFmpeg command executing...");
-    $this->log("⏳ Processing with Ultra Fast Mode (copy codec, no re-encode)");
+    // FIX: Log full command for debugging
+    $this->log("🚀 FFmpeg command:");
+    $this->log($command, true);
 
     $descriptorspec = [
       0 => ["pipe", "r"],
@@ -526,6 +557,8 @@ class VideoMergerUltra
     if ($status && isset($status['pid'])) {
       $this->saveProcessPid($status['pid']);
       $this->log("🔢 FFmpeg PID: " . $status['pid']);
+    } else {
+      throw new Exception("Cannot get FFmpeg PID");
     }
 
     stream_set_blocking($pipes[1], false);
@@ -536,6 +569,54 @@ class VideoMergerUltra
     $lastHeartbeat = time();
     $progressStartTime = microtime(true);
     $lastLogTime = 0;
+    $hasStarted = false;
+
+    // FIX: Wait for FFmpeg to actually start (max 10s)
+    $startWaitTime = time();
+    while (!$hasStarted && (time() - $startWaitTime) < 10) {
+      $status = proc_get_status($process);
+
+      if (!$status['running']) {
+        // Process died immediately - check errors
+        $allErrors = stream_get_contents($pipes[2]);
+        fclose($pipes[0]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+
+        $this->log("❌ FFmpeg died immediately. Errors:", true);
+        $this->log($allErrors, true);
+        throw new Exception("FFmpeg failed to start. Check merge_log.txt for details.");
+      }
+
+      $output = fgets($pipes[1]);
+      $error = fgets($pipes[2]);
+
+      if ($error !== false && !empty($error)) {
+        $errorOutput .= $error;
+        // Check for startup errors
+        if (stripos($error, 'error') !== false || stripos($error, 'invalid') !== false) {
+          $this->log("⚠️ FFmpeg startup warning: $error");
+        }
+      }
+
+      if ($output !== false && !empty($output)) {
+        $hasStarted = true;
+        $this->log("✅ FFmpeg started successfully");
+        $this->updateProgress(0.5, 'encoding', 0, $totalDuration);
+        break;
+      }
+
+      usleep(100000); // 0.1s
+    }
+
+    if (!$hasStarted) {
+      fclose($pipes[0]);
+      fclose($pipes[1]);
+      fclose($pipes[2]);
+      proc_close($process);
+      throw new Exception("FFmpeg timeout: No output after 10s. Check merge_log.txt");
+    }
 
     // ===== ENHANCED PROGRESS PARSING WITH MULTIPLE PATTERNS =====
     while (true) {
@@ -548,7 +629,7 @@ class VideoMergerUltra
       // Heartbeat logging every 30s
       if (time() - $lastHeartbeat >= 30) {
         $elapsed = round(microtime(true) - $progressStartTime);
-        $this->log("💓 Processing... " . round($lastProgress, 1) . "% ({$elapsed}s)");
+        $this->log("💗 Processing... " . round($lastProgress, 1) . "% ({$elapsed}s)");
         $lastHeartbeat = time();
       }
 
@@ -563,20 +644,13 @@ class VideoMergerUltra
         $currentTime = 0;
 
         // Try multiple patterns for better compatibility
-        // Pattern 1: out_time_us (microseconds) - most accurate
         if (preg_match('/out_time_us=(\d+)/', $output, $matches)) {
           $currentTime = intval($matches[1]) / 1000000;
-        }
-        // Pattern 2: out_time_ms (milliseconds) - fallback
-        elseif (preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
+        } elseif (preg_match('/out_time_ms=(\d+)/', $output, $matches)) {
           $currentTime = intval($matches[1]) / 1000;
-        }
-        // Pattern 3: out_time (formatted) - last resort
-        elseif (preg_match('/out_time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
+        } elseif (preg_match('/out_time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
           $currentTime = intval($matches[1]) * 3600 + intval($matches[2]) * 60 + floatval($matches[3]);
-        }
-        // Pattern 4: time= (from stderr sometimes)
-        elseif (preg_match('/time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
+        } elseif (preg_match('/time=(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
           $currentTime = intval($matches[1]) * 3600 + intval($matches[2]) * 60 + floatval($matches[3]);
         }
 
@@ -623,7 +697,8 @@ class VideoMergerUltra
       });
 
       if (!empty($relevantErrors)) {
-        $this->log("⚠️ FFmpeg warnings/errors:\n" . implode("\n", array_slice($relevantErrors, -10)));
+        $this->log("⚠️ FFmpeg warnings/errors:");
+        $this->log(implode("\n", array_slice($relevantErrors, -10)), true);
       }
     }
 
@@ -733,7 +808,7 @@ class VideoMergerUltra
       $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
 
       $subtitles = $this->parseSRT($content);
-      $this->log("  ✓ $srtFile: " . count($subtitles) . " subs (offset: " . round($timeOffset, 2) . "s)");
+      $this->log("  ✅ $srtFile: " . count($subtitles) . " subs (offset: " . round($timeOffset, 2) . "s)");
 
       foreach ($subtitles as $subtitle) {
         $startTime = $this->addTimeOffset($subtitle['start'], $timeOffset);
@@ -824,10 +899,9 @@ class VideoMergerUltra
     return round($bytes, 2) . ' ' . $units[$i];
   }
 
-  // ===== FIX: Format time correctly (no decimal places) =====
   private function formatTime($seconds)
   {
-    $seconds = round($seconds); // Remove decimals
+    $seconds = round($seconds);
     $h = floor($seconds / 3600);
     $m = floor(($seconds % 3600) / 60);
     $s = $seconds % 60;
