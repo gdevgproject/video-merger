@@ -173,6 +173,15 @@
       white-space: nowrap;
     }
 
+    .sanitized-badge {
+      background: #28a745;
+      color: white;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+
     .srt-info {
       margin-top: 15px;
       padding: 15px;
@@ -411,30 +420,42 @@
       color: #999;
       margin-top: 3px;
     }
+
+    .sanitization-info {
+      background: #d1ecf1;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 15px;
+      border-left: 4px solid #17a2b8;
+    }
+
+    .sanitization-info strong {
+      color: #0c5460;
+    }
   </style>
 </head>
 
 <body>
   <div class="container">
     <h1>🚀 Video & SRT Merger Pro - Ultra</h1>
-    <p class="subtitle">⚡ Optimized for massive workloads: 50+ videos, 10+ hours, several GB files</p>
+    <p class="subtitle">⚡ Enhanced with Input Sanitization & FFmpeg Control</p>
 
     <div class="info-box">
       <strong>🔥 Ultra Performance Features:</strong>
       <ul>
-        <li>✅ Real-time accurate progress tracking with ETA</li>
-        <li>✅ File size monitoring for live feedback</li>
-        <li>✅ Optimized for large files (50+ videos, 10+ hours output)</li>
-        <li>✅ Maximum CPU/RAM utilization (i7 Gen 10, 12GB RAM)</li>
-        <li>✅ Advanced FFmpeg flags for speed & reliability</li>
+        <li>✅ Automatic filename sanitization (removes emoji, special chars)</li>
+        <li>✅ Safe processing of files with spaces, !, #, +, = and more</li>
+        <li>✅ Enhanced FFmpeg process control (no background processes)</li>
+        <li>✅ Real-time progress tracking with file size monitoring</li>
+        <li>✅ Optimized for large workloads (50+ videos, 10+ hours)</li>
+        <li>✅ Windows 11 compatible with full process termination</li>
         <li>✅ Smart retry system with checkpoint recovery</li>
-        <li>✅ 100% success rate guarantee</li>
       </ul>
     </div>
 
     <form id="mergeForm">
       <div class="form-group">
-        <label for="inputPath">📁 Thư mục chứa video & SRT</label>
+        <label for="inputPath">📂 Thư mục chứa video & SRT</label>
         <input type="text" id="inputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals – Part 1" required>
       </div>
 
@@ -460,6 +481,7 @@
     <div class="file-preview" id="filePreview">
       <h3>📋 Danh sách file sẽ gộp (theo thứ tự):</h3>
       <div class="file-grid" id="fileList"></div>
+      <div class="sanitization-info" id="sanitizationInfo" style="display: none;"></div>
       <div class="srt-info" id="srtInfo" style="display: none;"></div>
       <div class="stats-box" id="statsBox" style="display: none;"></div>
       <div class="warning-box" id="skippedWarning" style="display: none;">
@@ -471,7 +493,7 @@
     <div class="progress-section" id="progressSection">
       <div class="progress-item">
         <div class="progress-header">
-          <span class="progress-title">🔍 Quét và phân tích files</span>
+          <span class="progress-title">🔍 Quét và sanitize files</span>
           <span class="progress-status status-pending" id="scanStatus">Chờ xử lý</span>
         </div>
         <div class="progress-bar-container">
@@ -561,6 +583,8 @@
     let outputVideoPath = '';
     let consecutiveZeroProgress = 0;
     let estimatedOutputSize = 0;
+    let scannedVideoData = [];
+    let scannedSRTData = [];
 
     window.addEventListener('beforeunload', (e) => {
       if (isProcessing) {
@@ -665,8 +689,8 @@
     async function processFiles(inputPath, outputPath, outputName) {
       document.getElementById('progressSection').classList.add('active');
 
-      // Step 1: Scan files
-      updateStep('scan', 'processing', 'Đang quét thư mục và validate files...');
+      // Step 1: Scan files with sanitization
+      updateStep('scan', 'processing', 'Đang quét và sanitize filenames...');
 
       const scanResponse = await fetch('process.php', {
         method: 'POST',
@@ -689,8 +713,12 @@
       estimatedOutputSize = scanData.estimated_size || 0;
       outputVideoPath = outputPath + '\\' + outputName + '.mp4';
 
+      // Store data for later use
+      scannedVideoData = scanData.files.videos;
+      scannedSRTData = scanData.files.srt_all;
+
       displayFileList(scanData.files, scanData.srt_info, scanData.skipped, scanData.stats);
-      updateStep('scan', 'complete', `✓ ${scanData.files.videos.length} videos, ${scanData.srt_info.total} SRT (${formatTime(Math.round(totalVideoDuration))})`, 100);
+      updateStep('scan', 'complete', `✓ ${scanData.files.videos.length} videos scanned (${formatTime(Math.round(totalVideoDuration))})`, 100);
 
       // Step 2: Merge SRT
       if (scanData.srt_info.total > 0) {
@@ -706,8 +734,8 @@
             inputPath,
             outputPath,
             outputName,
-            srt_files: scanData.files.srt_all,
-            videos: scanData.files.videos,
+            srt_data: scannedSRTData,
+            video_data: scannedVideoData,
             processId: currentProcessId
           }),
           signal: abortController.signal
@@ -726,7 +754,6 @@
         updateStep('video', 'processing', 'Đang khởi động FFmpeg...');
         videoStartTime = Date.now();
 
-        // Start enhanced progress polling
         startEnhancedProgressPolling(outputPath, outputName);
 
         const videoResponse = await fetch('process.php', {
@@ -739,7 +766,7 @@
             inputPath,
             outputPath,
             outputName,
-            videos: scanData.files.videos,
+            video_data: scannedVideoData,
             total_duration: totalVideoDuration,
             processId: currentProcessId
           }),
@@ -795,16 +822,13 @@
             const fileSize = data.file_size || 0;
             const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
 
-            // Update debug info
             const debugEl = document.getElementById('videoDebug');
             debugEl.textContent = `Debug: progress=${progress.toFixed(1)}%, fileSize=${fileSizeMB}MB, status=${data.status || 'unknown'}`;
 
-            // Check if file size is growing (alternative progress indicator)
             if (fileSize > lastFileSize) {
               fileSizeStuckCount = 0;
               lastFileSize = fileSize;
 
-              // If FFmpeg progress is stuck but file is growing, estimate progress from file size
               if (progress < 1 && estimatedOutputSize > 0) {
                 progress = Math.min((fileSize / estimatedOutputSize) * 100, 99);
                 console.log(`Using file size based progress: ${progress.toFixed(1)}%`);
@@ -813,7 +837,6 @@
               fileSizeStuckCount++;
             }
 
-            // Detect stuck: file size not growing for 30 seconds
             if (fileSizeStuckCount > 30 && progress < 99) {
               clearInterval(progressPolling);
               showError('Process stuck: File size not growing. FFmpeg may have frozen.');
@@ -834,7 +857,6 @@
               progressText.textContent = `Đang xử lý... ${progress.toFixed(1)}%`;
             }
 
-            // Calculate ETA
             if (progress > 1 && totalVideoDuration > 0) {
               const elapsed = (Date.now() - videoStartTime) / 1000;
               const estimatedTotal = (elapsed / progress) * 100;
@@ -845,12 +867,11 @@
               }
             }
 
-            // Track zero progress
             if (progress < 0.1) {
               consecutiveZeroProgress++;
-              if (consecutiveZeroProgress > 60) { // 60 seconds stuck at 0%
+              if (consecutiveZeroProgress > 60) {
                 clearInterval(progressPolling);
-                showError('Progress stuck at 0% for 60 seconds. Check merge_log.txt for details.');
+                showError('Progress stuck at 0% for 60 seconds. Check merge_log.txt.');
                 stopProcessing();
               }
             } else {
@@ -874,7 +895,7 @@
             showError('Lost connection to server. Process may still be running. Check output folder.');
           }
         }
-      }, 1000); // Poll every 1 second
+      }, 1000);
     }
 
     function updateStep(step, status, text, progress = 0) {
@@ -934,18 +955,37 @@
       const skippedWarningEl = document.getElementById('skippedWarning');
       const skippedListEl = document.getElementById('skippedList');
       const statsBoxEl = document.getElementById('statsBox');
+      const sanitizationInfoEl = document.getElementById('sanitizationInfo');
 
       fileListEl.innerHTML = '';
 
-      files.videos.forEach((file, index) => {
+      let sanitizedCount = 0;
+      files.videos.forEach((video, index) => {
         const div = document.createElement('div');
         div.className = 'file-item';
+
+        let sanitizedBadge = '';
+        if (video.sanitized) {
+          sanitizedCount++;
+          sanitizedBadge = ' <span class="sanitized-badge">SANITIZED</span>';
+        }
+
         div.innerHTML = `
           <span class="file-number">#${index + 1}</span>
-          <span class="file-name" title="${file}">🎬 ${file}</span>
+          <span class="file-name" title="${video.original_file || video.file}">🎬 ${video.file}</span>
+          ${sanitizedBadge}
         `;
         fileListEl.appendChild(div);
       });
+
+      // Sanitization info
+      if (sanitizedCount > 0) {
+        sanitizationInfoEl.innerHTML = `
+          <strong>🧹 File Sanitization:</strong><br>
+          Đã sanitize ${sanitizedCount} file(s) - loại bỏ emoji, ký tự đặc biệt, spaces để đảm bảo tương thích với FFmpeg.
+        `;
+        sanitizationInfoEl.style.display = 'block';
+      }
 
       // SRT info
       let srtInfoText = '<strong>📝 Phụ đề tìm thấy:</strong> ';
@@ -964,12 +1004,11 @@
 
       // Stats
       if (stats) {
-        statsBoxEl.innerHTML = `
-          <strong>📊 Thống kê:</strong><br>
-          • Tổng dung lượng: ${stats.total_size}<br>
-          • Tổng thời lượng: ${stats.total_duration}<br>
-          • Dung lượng ước tính output: ${stats.estimated_output}
-        `;
+        let statsHTML = `<strong>📊 Thống kê:</strong><br>• Tổng dung lượng: ${stats.total_size}<br>• Tổng thời lượng: ${stats.total_duration}<br>• Dung lượng ước tính output: ${stats.estimated_output}`;
+        if (stats.sanitized_count > 0) {
+          statsHTML += `<br>• Files đã sanitize: ${stats.sanitized_count}`;
+        }
+        statsBoxEl.innerHTML = statsHTML;
         statsBoxEl.style.display = 'block';
       }
 
@@ -1041,6 +1080,8 @@
       lastProgressPercent = 0;
       consecutiveZeroProgress = 0;
       estimatedOutputSize = 0;
+      scannedVideoData = [];
+      scannedSRTData = [];
 
       ['scan', 'srt', 'video'].forEach(step => {
         document.getElementById(step + 'Status').className = 'progress-status status-pending';
