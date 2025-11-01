@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Video & SRT Merger Pro - Ultra Performance</title>
+  <title>Video & SRT Merger Pro V2 - Ultra Sanitization</title>
   <style>
     * {
       margin: 0;
@@ -432,37 +432,71 @@
     .sanitization-info strong {
       color: #0c5460;
     }
+
+    .alert-critical {
+      background: #f8d7da;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      border-left: 4px solid #dc3545;
+    }
+
+    .alert-critical strong {
+      color: #721c24;
+      font-size: 16px;
+    }
+
+    .alert-critical ul {
+      margin-top: 10px;
+      margin-left: 20px;
+    }
+
+    .alert-critical li {
+      margin-bottom: 5px;
+      color: #721c24;
+    }
   </style>
 </head>
 
 <body>
   <div class="container">
-    <h1>🚀 Video & SRT Merger Pro - Ultra</h1>
-    <p class="subtitle">⚡ Enhanced with Input Sanitization & FFmpeg Control</p>
+    <h1>🚀 Video & SRT Merger Pro V2</h1>
+    <p class="subtitle">⚡ Ultra Sanitization Engine - Windows 11 Optimized</p>
+
+    <div class="alert-critical">
+      <strong>🛡️ NEW: Aggressive Filename Sanitization</strong>
+      <ul>
+        <li>✅ Automatically removes ALL emojis, special characters, spaces from filenames</li>
+        <li>✅ Creates clean temporary copies in isolated folder</li>
+        <li>✅ Only allows: a-z, A-Z, 0-9, underscore (_), dash (-), dot (.)</li>
+        <li>✅ Guaranteed FFmpeg compatibility on Windows 11</li>
+        <li>✅ Enhanced process control - no background processes</li>
+        <li>✅ Extended timeout: 8 hours for large workloads</li>
+      </ul>
+    </div>
 
     <div class="info-box">
-      <strong>🔥 Ultra Performance Features:</strong>
+      <strong>📋 How It Works:</strong>
       <ul>
-        <li>✅ Automatic filename sanitization (removes emoji, special chars)</li>
-        <li>✅ Safe processing of files with spaces, !, #, +, = and more</li>
-        <li>✅ Enhanced FFmpeg process control (no background processes)</li>
-        <li>✅ Real-time progress tracking with file size monitoring</li>
-        <li>✅ Optimized for large workloads (50+ videos, 10+ hours)</li>
-        <li>✅ Windows 11 compatible with full process termination</li>
-        <li>✅ Smart retry system with checkpoint recovery</li>
+        <li>🔹 Scans your input folder for videos (MP4) and subtitles (SRT)</li>
+        <li>🔹 Sanitizes ALL filenames automatically (removes emoji, !, #, +, =, spaces, etc.)</li>
+        <li>🔹 Copies files to temporary work folder with clean names</li>
+        <li>🔹 Merges videos and SRT files using the sanitized copies</li>
+        <li>🔹 Outputs merged files to your output folder</li>
+        <li>🔹 Automatically cleans up temporary files after completion</li>
       </ul>
     </div>
 
     <form id="mergeForm">
       <div class="form-group">
-        <label for="inputPath">📂 Thư mục chứa video & SRT</label>
-        <input type="text" id="inputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals – Part 1" required>
+        <label for="inputPath">📂 Thư mục chứa video & SRT (Input)</label>
+        <input type="text" id="inputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals — Part 1" required>
       </div>
 
       <div class="form-row">
         <div class="form-group">
-          <label for="outputPath">💾 Thư mục xuất kết quả</label>
-          <input type="text" id="outputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals – Part 1\long" required>
+          <label for="outputPath">💾 Thư mục xuất kết quả (Output)</label>
+          <input type="text" id="outputPath" placeholder="D:\Courses\Course - JavaScript Jonas\02 - JavaScript Fundamentals — Part 1\long" required>
         </div>
 
         <div class="form-group">
@@ -493,7 +527,7 @@
     <div class="progress-section" id="progressSection">
       <div class="progress-item">
         <div class="progress-header">
-          <span class="progress-title">🔍 Quét và sanitize files</span>
+          <span class="progress-title">🔍 Quét & sanitize files</span>
           <span class="progress-status status-pending" id="scanStatus">Chờ xử lý</span>
         </div>
         <div class="progress-bar-container">
@@ -690,7 +724,7 @@
       document.getElementById('progressSection').classList.add('active');
 
       // Step 1: Scan files with sanitization
-      updateStep('scan', 'processing', 'Đang quét và sanitize filenames...');
+      updateStep('scan', 'processing', 'Đang quét & sanitize filenames...');
 
       const scanResponse = await fetch('process.php', {
         method: 'POST',
@@ -713,7 +747,6 @@
       estimatedOutputSize = scanData.estimated_size || 0;
       outputVideoPath = outputPath + '\\' + outputName + '.mp4';
 
-      // Store data for later use
       scannedVideoData = scanData.files.videos;
       scannedSRTData = scanData.files.srt_all;
 
@@ -831,13 +864,12 @@
 
               if (progress < 1 && estimatedOutputSize > 0) {
                 progress = Math.min((fileSize / estimatedOutputSize) * 100, 99);
-                console.log(`Using file size based progress: ${progress.toFixed(1)}%`);
               }
             } else if (fileSize > 0) {
               fileSizeStuckCount++;
             }
 
-            if (fileSizeStuckCount > 30 && progress < 99) {
+            if (fileSizeStuckCount > 40 && progress < 99) {
               clearInterval(progressPolling);
               showError('Process stuck: File size not growing. FFmpeg may have frozen.');
               stopProcessing();
@@ -869,9 +901,9 @@
 
             if (progress < 0.1) {
               consecutiveZeroProgress++;
-              if (consecutiveZeroProgress > 60) {
+              if (consecutiveZeroProgress > 90) {
                 clearInterval(progressPolling);
-                showError('Progress stuck at 0% for 60 seconds. Check merge_log.txt.');
+                showError('Progress stuck at 0% for 90 seconds. Check merge_log.txt.');
                 stopProcessing();
               }
             } else {
@@ -978,16 +1010,15 @@
         fileListEl.appendChild(div);
       });
 
-      // Sanitization info
       if (sanitizedCount > 0) {
         sanitizationInfoEl.innerHTML = `
-          <strong>🧹 File Sanitization:</strong><br>
-          Đã sanitize ${sanitizedCount} file(s) - loại bỏ emoji, ký tự đặc biệt, spaces để đảm bảo tương thích với FFmpeg.
+          <strong>🧹 Aggressive Sanitization Applied:</strong><br>
+          Đã sanitize ${sanitizedCount} file(s) - loại bỏ emoji, ký tự đặc biệt, spaces để đảm bảo tương thích với FFmpeg.<br>
+          Files đã được copy sang temp folder với tên sạch.
         `;
         sanitizationInfoEl.style.display = 'block';
       }
 
-      // SRT info
       let srtInfoText = '<strong>📝 Phụ đề tìm thấy:</strong> ';
       const details = [];
       if (srtInfo.en > 0) details.push(`${srtInfo.en} file EN`);
@@ -1002,17 +1033,18 @@
         srtInfoEl.style.display = 'none';
       }
 
-      // Stats
       if (stats) {
         let statsHTML = `<strong>📊 Thống kê:</strong><br>• Tổng dung lượng: ${stats.total_size}<br>• Tổng thời lượng: ${stats.total_duration}<br>• Dung lượng ước tính output: ${stats.estimated_output}`;
         if (stats.sanitized_count > 0) {
           statsHTML += `<br>• Files đã sanitize: ${stats.sanitized_count}`;
         }
+        if (stats.temp_folder) {
+          statsHTML += `<br>• Temp folder: ${stats.temp_folder}`;
+        }
         statsBoxEl.innerHTML = statsHTML;
         statsBoxEl.style.display = 'block';
       }
 
-      // Skipped files
       if (skipped && skipped.length > 0) {
         skippedListEl.innerHTML = `Đã bỏ qua ${skipped.length} video lỗi: ` +
           skipped.map(f => `<br>- ${f}`).join('');
