@@ -163,14 +163,14 @@ class VideoMergerUltraV2
 
     $this->log("🧹 Cleaning up temp folder...", true);
 
-    $files = glob($this->tempWorkPath . DIRECTORY_SEPARATOR . '*');
-    $deleted = 0;
+    $files = @scandir($this->tempWorkPath);
+    if ($files === false) return;
 
+    $deleted = 0;
     foreach ($files as $file) {
-      if (is_file($file)) {
-        if (@unlink($file)) {
-          $deleted++;
-        }
+      if ($file === '.' || $file === '..') continue;
+      if (@unlink($this->tempWorkPath . DIRECTORY_SEPARATOR . $file)) {
+        $deleted++;
       }
     }
 
@@ -496,8 +496,6 @@ class VideoMergerUltraV2
             ];
           }
         }
-      } else {
-        @unlink($tempPath);
       }
     }
 
@@ -513,7 +511,17 @@ class VideoMergerUltraV2
 
     $this->checkDiskSpace($totalSize);
 
-    $tempFileCount = count(glob($this->tempWorkPath . DIRECTORY_SEPARATOR . '*.mp4'));
+    $filesInTemp = @scandir($this->tempWorkPath);
+    $mp4Count = 0;
+    if ($filesInTemp !== false) {
+      foreach ($filesInTemp as $file) {
+        if (strtolower(pathinfo($file, PATHINFO_EXTENSION)) === 'mp4') {
+          $mp4Count++;
+        }
+      }
+    }
+    $tempFileCount = $mp4Count;
+
     $this->log("📊 Verification: $tempFileCount MP4 files in temp folder");
 
     if ($tempFileCount === 0) {
@@ -594,14 +602,12 @@ class VideoMergerUltraV2
       throw new Exception("No SRT files to merge");
     }
 
-    // --- OPTIMIZATION: Pre-calculate cumulative duration offsets ---
     $videoOffsets = [];
     $cumulativeDuration = 0;
     foreach ($videoData as $video) {
       $videoOffsets[$video['order']] = $cumulativeDuration;
       $cumulativeDuration += $video['duration'];
     }
-    // --- END OPTIMIZATION ---
 
     $mergedContent = '';
     $subtitleCounter = 1;
@@ -620,7 +626,6 @@ class VideoMergerUltraV2
         continue;
       }
 
-      // Use the pre-calculated offset.
       $timeOffset = $videoOffsets[$srtItem['order']] ?? 0;
 
       $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
@@ -660,7 +665,7 @@ class VideoMergerUltraV2
       if (empty($block)) continue;
 
       $lines = explode("\n", $block);
-      if (count($lines) < 2) continue; // Changed to 2 to be more lenient
+      if (count($lines) < 2) continue;
 
       $timelineLine = $lines[1] ?? '';
 
@@ -710,7 +715,19 @@ class VideoMergerUltraV2
       throw new Exception("Temp work folder not found! Path: {$this->tempWorkPath}");
     }
 
-    $tempFileCount = count(glob($this->tempWorkPath . DIRECTORY_SEPARATOR . '*.mp4'));
+    // --- FIX: Use scandir instead of glob to handle special characters in the path ---
+    $filesInTemp = @scandir($this->tempWorkPath);
+    $mp4Count = 0;
+    if ($filesInTemp !== false) {
+      foreach ($filesInTemp as $file) {
+        if (strtolower(pathinfo($file, PATHINFO_EXTENSION)) === 'mp4') {
+          $mp4Count++;
+        }
+      }
+    }
+    $tempFileCount = $mp4Count;
+    // --- END FIX ---
+
     $this->log("📊 Pre-merge verification: $tempFileCount MP4 files in temp folder");
 
     if ($tempFileCount === 0) {
@@ -779,7 +796,6 @@ class VideoMergerUltraV2
 
     $ffmpegOutputFile = $this->ffmpegLogFile;
 
-    // --- IMPROVED & ROBUST COMMAND ---
     $command = sprintf(
       '"%s" -f concat -safe 0 -i "%s" -c copy -avoid_negative_ts make_zero -max_muxing_queue_size 9999 -movflags +faststart -y "%s" > "%s" 2>&1',
       FFMPEG_PATH,
@@ -794,8 +810,6 @@ class VideoMergerUltraV2
 
     $startTime = time();
 
-    // --- CRITICAL FIX for Windows background execution ---
-    // Add an empty quoted string "" as a dummy title for the 'start' command.
     exec('start /B "" ' . $command, $execOutput, $returnCode);
 
     $this->log("📢 FFmpeg started in background, return code: $returnCode");
@@ -808,7 +822,7 @@ class VideoMergerUltraV2
       sleep(1);
 
       if (file_exists($outputVideo)) {
-        clearstatcache(true, $outputVideo); // Clear file stat cache
+        clearstatcache(true, $outputVideo);
         $currentSize = filesize($outputVideo);
 
         if ($currentSize > $lastFileSize) {
@@ -817,7 +831,7 @@ class VideoMergerUltraV2
 
           $progress = 0;
           if ($totalDuration > 0 && $currentSize > 0) {
-            $estimatedSeconds = $currentSize / 102400; // Rough estimate
+            $estimatedSeconds = $currentSize / 102400;
             $progress = min(($estimatedSeconds / $totalDuration) * 100, 99.5);
           }
 
@@ -874,7 +888,7 @@ class VideoMergerUltraV2
     }
 
     $fileSize = filesize($outputVideo);
-    if ($fileSize < 1024 * 1024) { // 1MB minimum
+    if ($fileSize < 1024 * 1024) {
       throw new Exception("Output file too small ($fileSize bytes). Check ffmpeg_output.txt for errors.");
     }
 
