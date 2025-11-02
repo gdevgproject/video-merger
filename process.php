@@ -26,7 +26,7 @@ class VideoMergerUltraV2
   private $processIdFile;
   private $tempPathFile;
   private $errorLogFile;
-  private $ffmpegLogFile; // NEW: Separate FFmpeg output file
+  private $ffmpegLogFile;
   private $currentProcessPid = null;
   private $lastProgressUpdate = 0;
   private $logBuffer = [];
@@ -40,7 +40,20 @@ class VideoMergerUltraV2
   {
     $this->silentMode = $silentMode;
     $this->inputPath = rtrim($inputPath, '\\/');
-    $this->outputPath = rtrim($outputPath, '\\/');
+    $baseOutputPath = rtrim($outputPath, '\\/');
+
+    // --- NEW: Create and use a dedicated sub-folder for all output ---
+    $subfolderName = 'long video';
+    $finalOutputPath = $baseOutputPath . DIRECTORY_SEPARATOR . $subfolderName;
+
+    if (!is_dir($finalOutputPath)) {
+      if (!@mkdir($finalOutputPath, 0777, true)) {
+        throw new Exception("Cannot create output sub-folder: {$finalOutputPath}");
+      }
+    }
+    $this->outputPath = $finalOutputPath; // Re-assign the main output path for the entire class
+    // --- END NEW ---
+
     $this->logFile = $this->outputPath . DIRECTORY_SEPARATOR . 'merge_log.txt';
     $this->errorLogFile = $this->outputPath . DIRECTORY_SEPARATOR . 'error_log.txt';
     $this->ffmpegLogFile = $this->outputPath . DIRECTORY_SEPARATOR . 'ffmpeg_output.txt';
@@ -288,7 +301,7 @@ class VideoMergerUltraV2
         }
 
         if (!empty($outputPath) && !empty($outputName)) {
-          $videoPath = $outputPath . DIRECTORY_SEPARATOR . $outputName . '.mp4';
+          $videoPath = $outputPath . DIRECTORY_SEPARATOR . 'long video' . DIRECTORY_SEPARATOR . $outputName . '.mp4';
           if (file_exists($videoPath)) {
             $data['file_size'] = filesize($videoPath);
           }
@@ -371,12 +384,6 @@ class VideoMergerUltraV2
 
     if (!is_dir($this->inputPath)) {
       throw new Exception("Input directory not found: {$this->inputPath}");
-    }
-
-    if (!is_dir($this->outputPath)) {
-      if (!@mkdir($this->outputPath, 0777, true)) {
-        throw new Exception("Cannot create output directory: {$this->outputPath}");
-      }
     }
 
     $this->validateFFmpeg();
@@ -715,7 +722,6 @@ class VideoMergerUltraV2
       throw new Exception("Temp work folder not found! Path: {$this->tempWorkPath}");
     }
 
-    // --- FIX: Use scandir instead of glob to handle special characters in the path ---
     $filesInTemp = @scandir($this->tempWorkPath);
     $mp4Count = 0;
     if ($filesInTemp !== false) {
@@ -726,7 +732,6 @@ class VideoMergerUltraV2
       }
     }
     $tempFileCount = $mp4Count;
-    // --- END FIX ---
 
     $this->log("📊 Pre-merge verification: $tempFileCount MP4 files in temp folder");
 
